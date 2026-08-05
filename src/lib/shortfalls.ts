@@ -1,0 +1,174 @@
+// Aggregation behind the "largest shortfalls" chart. The chart can group either
+// by material number or by load (delivery order number).
+
+import { dateSortKey } from './table-sort.js'
+
+export type ShortfallDelivery = {
+  orderNumber: string
+  quantity: number
+  loadingDate?: string
+  shipDate?: string
+}
+
+export type ShortfallMaterial = {
+  material: string
+  materialName: string
+  totalOnHand: number
+  requested: number
+  variance: number
+  deliveries: readonly ShortfallDelivery[]
+}
+
+export type LoadShortfall = {
+  orderNumber: string
+  /** Distinct material numbers this load needs. */
+  materials: string[]
+  /** Total quantity the load asks for across all its lines. */
+  requested: number
+  /**
+   * Stock this load can actually draw on: its own demand, capped by what is
+   * left of each material after every earlier-shipping load has taken its
+   * share. Because it is capped at what the load asks for, it reads directly
+   * against `requested` — a covered load shows the two as equal.
+   */
+  totalOnHand: number
+  /** `totalOnHand - requested` — the cases this load is short. */
+  variance: number
+  /** The material short the most cases on this load, used as the jump target from the chart. */
+  worstMaterial: string
+  /** Ship date the load was allocated on, for the chart tooltip. Blank if none of its lines carry one. */
+  shipDate: string
+}
+
+type LoadEntry = {
+  orderNumber: string
+  /** Material number -> quantity this load asks for. */
+  demand: Map<string, number>
+  requested: number
+  /** Parsed ship (or loading) date, driving allocation order. */
+  dateKey: number
+  shipDate: string
+}
+
+// A load ships once, so if its lines disagree the earliest date is the one that
+// matters. Ship date is the real commitment; loading date is the fallback for
+// exports where ship date is blank.
+function earliestDateKey(...texts: Array<string | undefined>): number {
+  let best = Number.POSITIVE_INFINITY
+  for (const text of texts) {
+    if (!text) continue
+    const key = dateSortKey(text)
+    if (Number.isFinite(key) && key < best) best = key
+  }
+  return best
+}
+
+export function groupShortfallsByLoad(
+  materials: readonly ShortfallMaterial[],
+): LoadShortfall[] {
+  const byLoad = new Map<string, LoadEntry>()
+
+  for (const material of materials) {
+    for (const delivery of material.deliveries) {
+      const orderNumber = delivery.orderNumber || '(no order #)'
+      let entry = byLoad.get(orderNumber)
+      if (!entry) {
+        entry = {
+          orderNumber,
+          demand: new Map<string, number>(),
+          requested: 0,
+          dateKey: Number.POSITIVE_INFINITY,
+          shipDate: '',
+        }
+        byLoad.set(orderNumber, entry)
+      }
+
+      entry.demand.set(
+        material.material,
+        (entry.demand.get(material.material) ?? 0) + delivery.quantity,
+      )
+      entry.requested += delivery.quantity
+
+      const dateKey = earliestDateKey(delivery.shipDate, delivery.loadingDate)
+      if (dateKey < entry.dateKey) {
+        entry.dateKey = dateKey
+        entry.shipDate = delivery.shipDate || delivery.loadingDate || ''
+      }
+    }
+  }
+
+  // Stock is finite and the same cases cannot cover two loads, so it is handed
+  // out rather than counted once per load: walk the loads in ship-date order —
+  // the load that ships first has first call on the stock — and draw each
+  // material down as it is committed. What a load gets is therefore what is
+  // genuinely still there for it, and undated loads sort last because they
+  // cannot claim priority over a load with a date on it.
+  const remaining = new Map(
+    materials.map((m) => [m.material, Math.max(m.totalOnHand, 0)] as const),
+  )
+
+  const ordered = [...byLoad.values()].sort((a, b) => {
+    if (a.dateKey !== b.dateKey) return a.dateKey - b.dateKey
+    return a.orderNumber.localeCompare(b.orderNumber)
+  })
+
+  const loads: LoadShortfall[] = []
+
+  for (const entry of ordered) {
+    let totalOnHand = 0
+    let worstMaterial = ''
+    let worstShort = 0
+
+    for (const [material, demand] of entry.demand) {
+      const stock = remaining.get(material) ?? 0
+      const covered = Math.min(demand, stock)
+      remaining.set(material, stock - covered)
+      totalOnHand += covered
+
+      const short = demand - covered
+      if (short > worstShort) {
+        worstShort = short
+        worstMaterial = material
+      }
+    }
+
+    const materialNumbers = [...entry.demand.keys()]
+
+    loads.push({
+      orderNumber: entry.orderNumber,
+      materials: materialNumbers,
+      requested: entry.requested,
+      totalOnHand,
+      variance: totalOnHand - entry.requested,
+      // Nothing short means no driving material; fall back to the first one so
+      // a bar click still lands somewhere useful.
+      worstMaterial: worstMaterial || materialNumbers[0] || '',
+      shipDate: entry.shipDate,
+    })
+  }
+
+  return loads
+}
+
+/** Worst shortfall first. Only rows that are actually short are worth charting. */
+export function topShortfallLoads(
+  materials: readonly ShortfallMaterial[],
+  limit: number,
+): LoadShortfall[] {
+  return groupShortfallsByLoad(materials)
+    .filter((load) => load.variance < 0)
+    .sort((a, b) => a.variance - b.variance)
+    .slice(0, limit)
+}
+
+export function topShortfallMaterials<T extends { requested: number; variance: number }>(
+  materials: readonly T[],
+  limit: number,
+): T[] {
+  // Only materials with actual load demand are worth charting — otherwise the
+  // biggest bars are just high-stock items nobody has ordered.
+  return [...materials]
+    .filter((m) => m.requested > 0)
+    .sort((a, b) => a.variance - b.variance)
+    .slice(0, limit)
+}

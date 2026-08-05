@@ -1,37 +1,81 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import {
-  parseCsv,
+  parseReportFile,
   saveReport,
+  clearReport,
   getAllReports,
-  computeVariance,
+  computeMaterialSummary,
+  resolveFootprints,
+  listFootprints,
+  upsertFootprint,
+  deleteFootprintOverride,
+  REPORT_TYPES,
+  type ReportType,
 } from './reports.server.js'
 
-export const getVarianceData = createServerFn({ method: 'GET' }).handler(
-  async () => {
-    const reportsWithLines = await getAllReports()
-    const variance = computeVariance(reportsWithLines)
-    return {
-      reports: reportsWithLines.map((r) => ({
-        id: r.id,
-        slot: r.slot,
-        label: r.label,
-      })),
-      variance,
-    }
-  },
-)
+const reportTypeSchema = z.enum(REPORT_TYPES as [ReportType, ...ReportType[]])
+
+export const getVarianceData = createServerFn({ method: 'GET' }).handler(async () => {
+  const [reportsWithLines, footprints] = await Promise.all([
+    getAllReports(),
+    resolveFootprints(),
+  ])
+  const materials = computeMaterialSummary(reportsWithLines, footprints)
+  return {
+    reports: reportsWithLines.map((r) => ({
+      id: r.id,
+      type: r.type,
+      label: r.label,
+      lineCount: r.lines.length,
+    })),
+    materials,
+  }
+})
 
 export const uploadReport = createServerFn({ method: 'POST' })
   .inputValidator(
     z.object({
-      slot: z.number().int().min(1).max(3),
+      type: reportTypeSchema,
       label: z.string().min(1).max(120),
-      csvText: z.string(),
+      // Uploads are sent as base64 so binary .xlsx files survive the round trip.
+      fileBase64: z.string(),
     }),
   )
   .handler(async ({ data }) => {
-    const lines = parseCsv(data.csvText)
-    const report = await saveReport(data.slot, data.label, lines)
+    const buffer = Buffer.from(data.fileBase64, 'base64')
+    const lines = parseReportFile(buffer, data.type)
+    const report = await saveReport(data.type, data.label, lines)
     return { id: report.id, lineCount: lines.length }
   })
+
+export const removeReport = createServerFn({ method: 'POST' })
+  .inputValidator(z.object({ type: reportTypeSchema }))
+  .handler(async ({ data }) => clearReport(data.type))
+
+export const getFootprints = createServerFn({ method: 'GET' }).handler(async () =>
+  listFootprints(),
+)
+
+export const saveFootprint = createServerFn({ method: 'POST' })
+  .inputValidator(
+    z.object({
+      // Material numbers are digit strings everywhere else in the app; holding
+      // to that means a typo can't create a footprint nothing will ever match.
+      material: z
+        .string()
+        .trim()
+        .min(1)
+        .max(40)
+        .regex(/^[0-9]+$/, 'Material number must be digits only'),
+      casesPerPallet: z
+        .number()
+        .positive('Cases per pallet must be greater than zero')
+        .max(100000),
+    }),
+  )
+  .handler(async ({ data }) => upsertFootprint(data.material, data.casesPerPallet))
+
+export const resetFootprint = createServerFn({ method: 'POST' })
+  .inputValidator(z.object({ material: z.string().trim().min(1).max(40) }))
+  .handler(async ({ data }) => deleteFootprintOverride(data.material))
