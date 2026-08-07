@@ -17,12 +17,13 @@ export function formatCustomerPo(customerPO: string) {
   return customerPO.trim()
 }
 
-// Freight orders arrive zero-padded to 20 characters ("000…00112578510"). The
-// leading run is padding, not part of the number.
+// Load numbers are whole identifiers too. They come from the same 10-digit,
+// unpadded K/L pair as the Customer PO, so — like the PO — the string renders
+// exactly as the export gives it. (The old zero-stripping here existed for the
+// 20-character zero-padded freight order in column P, which is no longer read;
+// applied to a K/L value it would eat a real leading digit.)
 export function formatLoadNumber(orderNumber: string) {
-  const trimmed = orderNumber.trim()
-  const stripped = trimmed.replace(/^0+(?=[0-9])/, '')
-  return stripped || trimmed
+  return orderNumber.trim()
 }
 
 // One material's quantity. Materials with no footprint key match cannot be
@@ -78,6 +79,15 @@ export function formatTotal(total: UnitTotal, palletView: boolean) {
     return `${formatNumber(total.unkeyedCases)} cs`
   }
   return `${formatNumber(total.pallets)} pl`
+}
+
+// In pallet view a total is only as complete as the footprint key: cases whose
+// material has no match can't be converted, so a tile says how many are sitting
+// outside the pallet figure instead of quietly dropping them. Blank when there
+// is nothing left over to mention.
+export function unkeyedNote(total: UnitTotal, palletView: boolean) {
+  if (!palletView || total.unkeyedCases === 0 || total.pallets === 0) return ''
+  return `+ ${formatNumber(total.unkeyedCases)} cs with no footprint`
 }
 
 /** One material's quantity as a number, for charting. Mirrors `formatQty`. */

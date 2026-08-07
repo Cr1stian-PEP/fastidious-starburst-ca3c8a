@@ -40,12 +40,12 @@ export type LoadLine = {
 
 export type LoadShortfall = {
   /**
-   * What identifies this load for grouping, refs and highlighting: the freight
-   * order when there is one, otherwise the Customer PO. Never blank, never
+   * What identifies this load for grouping, refs and highlighting: the load
+   * number when there is one, otherwise the Customer PO. Never blank, never
    * shared between two different loads.
    */
   key: string
-  /** Freight order (column P). Blank on the many rows the export leaves empty. */
+  /** Load number (column L on condition-02 rows). Blank on condition-01 pickups. */
   orderNumber: string
   /** Customer PO from the load's lines — the first non-empty one. */
   customerPO: string
@@ -106,11 +106,11 @@ function earliestDateKey(...texts: Array<string | undefined>): number {
   return best
 }
 
-// The export leaves the freight order blank on a large share of its rows, so it
-// cannot be the grouping key on its own — keying on it would fold hundreds of
-// unrelated deliveries into one "(no load #)" row and hide every PO in them.
-// The Customer PO identifies the load in that case. Returns '' for a line
-// carrying neither, which the grouper gives a key of its own.
+// Only condition-02 rows carry a load number (column L); a condition-01 row is
+// a customer pickup with no load of its own, so its Customer PO is what
+// identifies it. Keying on the load number alone would fold every 01 line into
+// one "(no load #)" row and hide every PO in it. Returns '' for a line carrying
+// neither, which the grouper gives a key of its own.
 export function deliveryLoadKey(delivery: ShortfallDelivery): string {
   const orderNumber = delivery.orderNumber?.trim()
   if (orderNumber) return `load:${orderNumber}`

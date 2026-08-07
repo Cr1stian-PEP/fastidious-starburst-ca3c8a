@@ -28,8 +28,15 @@ import {
   Ruler,
   ArrowRight,
   Boxes,
+  FileSpreadsheet,
+  Printer,
 } from 'lucide-react'
-import { getVarianceData, removeReport, uploadReport } from '../server/reports.functions'
+import {
+  exportVarianceWorkbook,
+  getVarianceData,
+  removeReport,
+  uploadReport,
+} from '../server/reports.functions'
 import { SortHeader } from '../components/sort-header'
 import {
   dateSortKey,
@@ -53,8 +60,14 @@ import {
   qtyValue,
   totalUnits,
   totalValue,
-  type UnitTotal,
+  unkeyedNote,
 } from '../lib/units'
+import {
+  buildLoadExport,
+  buildMaterialExport,
+  type ExportContext,
+} from '../lib/report-export'
+import { downloadBase64, printExportDocument } from '../lib/print-export'
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend)
 
@@ -145,14 +158,6 @@ function StatCard({
   )
 }
 
-// In pallet view a total is only as complete as the footprint key: cases whose
-// material has no match can't be converted, so the tile says how many are
-// sitting outside the pallet figure instead of quietly dropping them.
-function unkeyedNote(total: UnitTotal, palletView: boolean) {
-  if (!palletView || total.unkeyedCases === 0 || total.pallets === 0) return ''
-  return `+ ${formatNumber(total.unkeyedCases)} cs with no footprint`
-}
-
 async function fileToBase64(file: File): Promise<string> {
   const buffer = await file.arrayBuffer()
   const bytes = new Uint8Array(buffer)
@@ -168,6 +173,7 @@ function Home() {
   const router = useRouter()
   const data = Route.useLoaderData()
   const [pending, setPending] = useState<ReportType | null>(null)
+  const [exporting, setExporting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [palletView, setPalletView] = useState(false)
   const [expanded, setExpanded] = useState<string | null>(null)
@@ -306,8 +312,70 @@ function Home() {
   )
   const loadView = chartGroup === 'load'
 
-  // A load with no freight order still has to be identifiable on the chart, so
-  // it is labelled by its PO instead of being left blank.
+  // What the export has to record besides the rows: which filters produced
+  // them, in which units, and from which uploads. Timestamps come from here so
+  // the file is dated in the reader's own time zone rather than the server's.
+  function exportContext(): ExportContext {
+    const now = new Date()
+    return {
+      view: loadView ? 'load' : 'material',
+      palletView,
+      query,
+      shortfallsOnly,
+      from: shipFrom,
+      to: shipTo,
+      condition,
+      sources: data.reports.map((r) => r.label),
+      generatedAt: now.toLocaleString(),
+      dateStamp: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+        now.getDate(),
+      ).padStart(2, '0')}`,
+      shown: loadView ? visibleLoads.length : visibleMaterials.length,
+      total: loadView ? loads.length : materials.length,
+    }
+  }
+
+  // PDF comes out of the browser's own print dialog, on a copy of the report
+  // laid out for paper — the rows are the ones on screen, so no round trip.
+  function handleExportPdf() {
+    const ctx = exportContext()
+    printExportDocument(
+      loadView ? buildLoadExport(visibleLoads, ctx) : buildMaterialExport(visibleMaterials, ctx),
+    )
+  }
+
+  // Excel is written on the server, which rebuilds the view from the same pure
+  // filters and the same allocation rather than serialising the tab's rows.
+  async function handleExportExcel() {
+    setExporting(true)
+    setError(null)
+    try {
+      const ctx = exportContext()
+      const file = await exportVarianceWorkbook({
+        data: {
+          view: ctx.view,
+          palletView,
+          query,
+          shortfallsOnly,
+          from: shipFrom,
+          to: shipTo,
+          condition,
+          materialSort: sort,
+          loadSort,
+          generatedAt: ctx.generatedAt,
+          dateStamp: ctx.dateStamp,
+        },
+      })
+      downloadBase64(file.base64, file.fileName)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to build the Excel export')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  // A condition-01 pickup has no load number at all, so it is labelled by its
+  // PO instead of being left blank.
   function loadLabel(load: { orderNumber: string; customerPO: string }) {
     const number = formatLoadNumber(load.orderNumber)
     if (number) return number
@@ -363,7 +431,7 @@ function Home() {
 
   // In load mode the bars are loads, so a click lands on the load's own row
   // rather than on the material driving it. Loads are addressed by their key,
-  // not their freight order — many have none.
+  // not their load number — condition-01 pickups have none.
   function revealLoad(key: string) {
     if (!key) return
     if (!visibleLoads.some((l) => l.key === key)) {
@@ -561,6 +629,22 @@ function Home() {
           </div>
         )}
 
+        {/* Load numbers are read at upload time, so a report uploaded under the
+            old column-P mapping keeps its old load numbers until it is uploaded
+            again. Nothing on this page can fix that, so it asks. */}
+        {data.deliveryNeedsReupload && (
+          <div className="mb-8 flex items-start gap-2 bg-amber-50 text-amber-800 border border-amber-200 rounded-lg px-4 py-3 text-sm">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>
+              The outbound loads report was uploaded before load numbers moved
+              to column L. Its load numbers still come from the old column P —
+              which is blank on <strong>02</strong> rows and zero-padded on{' '}
+              <strong>01</strong> rows. Upload the outbound loads export again
+              to pick up the new mapping.
+            </span>
+          </div>
+        )}
+
         {materials.length === 0 ? (
           <div className="bg-white rounded-xl shadow-sm p-12 text-center text-gray-400">
             Upload at least one of production/materials and the delivery
@@ -620,7 +704,7 @@ function Home() {
                     </h2>
                     <p className="text-xs text-gray-400 mt-1 max-w-2xl">
                       {loadView
-                        ? 'Grouped by load number, filled in ship-date order: the stock a load can draw on is what is left after every earlier load has taken its share, so the two bars are that load’s own demand — what it can get against what it asks for. A load with no freight order is labelled by its Customer PO. Click a bar to jump to that load’s row in the table below.'
+                        ? 'Grouped by load number, filled in ship-date order: the stock a load can draw on is what is left after every earlier load has taken its share, so the two bars are that load’s own demand — what it can get against what it asks for. A pickup with no load number is labelled by its Customer PO. Click a bar to jump to that load’s row in the table below.'
                         : 'Grouped by material number. Click a bar to jump to that material’s row in the table below.'}
                       {palletView
                         ? ' Bars follow Pallet View; materials with no footprint stay in cases.'
@@ -830,7 +914,7 @@ function Home() {
                 <h2 className="text-lg font-semibold text-gray-900">
                   {loadView ? 'Variance by load' : 'Variance by material'}
                 </h2>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 flex-wrap">
                   <div className="relative">
                     <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
                     <input
@@ -856,6 +940,30 @@ function Home() {
                     <Filter className="w-4 h-4" />
                     {shortfallsOnly ? 'Shortfalls only: On' : 'Shortfalls Only'}
                   </button>
+                  {/* Exports are of the report as it is on screen — the same
+                      grouping, filters, sort and units — so they sit with the
+                      controls that decide all of that. */}
+                  <div className="inline-flex rounded-lg bg-gray-100 p-1">
+                    <button
+                      type="button"
+                      onClick={handleExportExcel}
+                      disabled={exporting}
+                      title="Download this view as an Excel workbook"
+                      className="inline-flex items-center gap-2 text-sm font-medium rounded-md px-3 py-1.5 text-gray-600 hover:text-gray-900 hover:bg-white hover:shadow-sm disabled:opacity-50 transition-colors"
+                    >
+                      <FileSpreadsheet className="w-4 h-4" />
+                      {exporting ? 'Building…' : 'Excel'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleExportPdf}
+                      title="Open a print-ready copy of this view — save it as PDF"
+                      className="inline-flex items-center gap-2 text-sm font-medium rounded-md px-3 py-1.5 text-gray-600 hover:text-gray-900 hover:bg-white hover:shadow-sm transition-colors"
+                    >
+                      <Printer className="w-4 h-4" />
+                      PDF
+                    </button>
+                  </div>
                 </div>
               </div>
               {palletView && missingFootprintCount > 0 && (
@@ -956,9 +1064,9 @@ function Home() {
                               </td>
                               <td className="py-2 pr-4 font-mono text-gray-900">
                                 {loadNumber || (
-                                  // The export leaves the freight order blank on
-                                  // a lot of rows. Say so on the row itself; the
-                                  // PO beside it is what identifies the load.
+                                  // A condition-01 pickup has no load number.
+                                  // Say so on the row itself; the PO beside it
+                                  // is what identifies it.
                                   <span className="text-gray-400 italic font-sans">
                                     No load #
                                   </span>
@@ -1323,7 +1431,7 @@ function Home() {
                                     {sortDeliveries(row.deliveries, deliverySort).map((d, i) => {
                                       // The highlight target is a load key, so
                                       // the line has to be keyed the same way —
-                                      // a line with no freight order belongs to
+                                      // a line with no load number belongs to
                                       // its PO's load, not to nothing.
                                       const isTargetLine =
                                         isHighlighted &&
