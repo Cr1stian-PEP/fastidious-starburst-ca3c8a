@@ -9,6 +9,10 @@ export type ShortfallDelivery = {
   quantity: number
   loadingDate?: string
   shipDate?: string
+  /** Plant the load ships from (column W). */
+  plantName?: string
+  /** Party the load ships to (column Y). */
+  soldTo?: string
 }
 
 export type ShortfallMaterial = {
@@ -45,6 +49,14 @@ export type LoadShortfall = {
   orderNumber: string
   /** Customer PO from the load's lines — the first non-empty one. */
   customerPO: string
+  /**
+   * Where the load ships from (column W) and where it goes (column Y). A load
+   * normally agrees across its lines, but nothing in the export guarantees it,
+   * so every distinct non-empty value is kept and joined rather than silently
+   * dropping the ones after the first. Blank when no line carries the field.
+   */
+  shipFrom: string
+  shipTo: string
   /** Distinct material numbers this load needs. */
   materials: string[]
   /** Per-material breakdown behind the totals below. */
@@ -70,6 +82,9 @@ type LoadEntry = {
   key: string
   orderNumber: string
   customerPO: string
+  /** Distinct ship-from plants / ship-to parties seen on the load's lines. */
+  shipFrom: Set<string>
+  shipTo: Set<string>
   /** Material number -> quantity this load asks for. */
   demand: Map<string, number>
   requested: number
@@ -129,6 +144,8 @@ export function groupShortfallsByLoad(
           key,
           orderNumber: delivery.orderNumber?.trim() ?? '',
           customerPO: '',
+          shipFrom: new Set<string>(),
+          shipTo: new Set<string>(),
           demand: new Map<string, number>(),
           requested: 0,
           dateKey: Number.POSITIVE_INFINITY,
@@ -140,6 +157,11 @@ export function groupShortfallsByLoad(
       // Lines on one load should agree on the PO; if they don't, the first
       // non-empty one stands for the load.
       if (!entry.customerPO && delivery.customerPO) entry.customerPO = delivery.customerPO
+
+      const plantName = delivery.plantName?.trim()
+      if (plantName) entry.shipFrom.add(plantName)
+      const soldTo = delivery.soldTo?.trim()
+      if (soldTo) entry.shipTo.add(soldTo)
 
       entry.demand.set(
         material.material,
@@ -206,6 +228,8 @@ export function groupShortfallsByLoad(
       key: entry.key,
       orderNumber: entry.orderNumber,
       customerPO: entry.customerPO,
+      shipFrom: [...entry.shipFrom].join(', '),
+      shipTo: [...entry.shipTo].join(', '),
       materials: materialNumbers,
       lines,
       requested: entry.requested,
