@@ -4,6 +4,9 @@ export const reports = pgTable("reports", {
   id: serial().primaryKey(),
   type: text("type").notNull(), // 'production' | 'materials' | 'delivery'
   label: text("label").notNull(),
+  // Retained so the schema matches the applied migration. Nothing writes it
+  // now: the production page reads the parsed schedule, not a raw grid.
+  rawSheet: text("raw_sheet"),
   createdAt: timestamp("created_at").defaultNow(),
 });
 
@@ -20,6 +23,8 @@ export const reportLines = pgTable("report_lines", {
   soldTo: text("sold_to"),
   loadingDate: text("loading_date"),
   shipDate: text("ship_date"),
+  // delivery-only: shipping condition from column T ('01' or '02')
+  shippingCondition: text("shipping_condition"),
   // production-only: the date block the row sits under in the schedule
   productionDate: text("production_date"),
 });

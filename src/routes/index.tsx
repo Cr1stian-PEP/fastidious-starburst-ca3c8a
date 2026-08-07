@@ -35,20 +35,24 @@ import {
   dateSortKey,
   filterAndSortLoads,
   filterAndSortMaterials,
-  filterMaterialsByShipDate,
+  filterMaterialsByDelivery,
   sortDeliveries,
   type DeliverySortKey,
   type LoadSortKey,
   type MaterialSortKey,
+  type ShippingCondition,
   type SortState,
 } from '../lib/table-sort'
-import { summarizeLoads, topShortfallMaterials } from '../lib/shortfalls'
+import { summarizeLoads, topShortfallMaterials, deliveryLoadKey } from '../lib/shortfalls'
 import {
   formatNumber,
-  formatOrderNumber,
+  formatCustomerPo,
+  formatLoadNumber,
   formatQty,
   formatTotal,
+  qtyValue,
   totalUnits,
+  totalValue,
   type UnitTotal,
 } from '../lib/units'
 
@@ -85,7 +89,7 @@ const SLOTS: Array<{
   {
     type: 'delivery',
     title: 'Outbound loads',
-    hint: 'Material # (col Q), Requested qty (col S, cond. col T = 02)',
+    hint: 'Material # (col Q), Requested qty (col S, cond. col T = 01/02)',
     icon: Truck,
     accent: 'bg-amber-500',
   },
@@ -101,6 +105,14 @@ const CHART_GROUPS: Array<{ value: ChartGroup; label: string; icon: typeof Facto
 ]
 
 const CHART_LIMIT = 15
+
+// Column T on the outbound loads export. Both conditions are stored at upload;
+// the default matches what the report has always shown.
+const SHIPPING_CONDITIONS: Array<{ value: ShippingCondition; label: string }> = [
+  { value: '01', label: '01' },
+  { value: '02', label: '02' },
+  { value: 'both', label: 'Both' },
+]
 
 // Where a chart click should take the reader: always a material row, plus the
 // delivery line to point at when the click came from the by-load view.
@@ -165,6 +177,9 @@ function Home() {
   // Ship-date window on the demand side. Blank on either end is open-ended.
   const [shipFrom, setShipFrom] = useState('')
   const [shipTo, setShipTo] = useState('')
+  // Shipping condition on the demand side. '02' is what the report showed
+  // before the selector existed, so it stays the default.
+  const [condition, setCondition] = useState<ShippingCondition>('02')
   const [chartOpen, setChartOpen] = useState(true)
   const [sort, setSort] = useState<SortState<MaterialSortKey>>({
     key: 'material',
@@ -225,13 +240,14 @@ function Home() {
     }
   }
 
-  // A ship-date window narrows the demand side before anything is computed, so
-  // the tiles, the chart and both tables all read the same filtered figures.
+  // A ship-date window and the shipping condition narrow the demand side before
+  // anything is computed, so the tiles, the chart and both tables all read the
+  // same filtered figures.
   const allMaterials = data.materials
   const rangeActive = Boolean(shipFrom || shipTo)
   const materials = useMemo(
-    () => filterMaterialsByShipDate(allMaterials, shipFrom, shipTo),
-    [allMaterials, shipFrom, shipTo],
+    () => filterMaterialsByDelivery(allMaterials, { from: shipFrom, to: shipTo, condition }),
+    [allMaterials, shipFrom, shipTo, condition],
   )
   // Undated delivery lines can't be shown to fall inside a window, so they are
   // dropped while one is active — worth saying out loud.
@@ -290,26 +306,46 @@ function Home() {
   )
   const loadView = chartGroup === 'load'
 
+  // A load with no freight order still has to be identifiable on the chart, so
+  // it is labelled by its PO instead of being left blank.
+  function loadLabel(load: { orderNumber: string; customerPO: string }) {
+    const number = formatLoadNumber(load.orderNumber)
+    if (number) return number
+    const po = formatCustomerPo(load.customerPO)
+    return po ? `PO ${po}` : 'No load #'
+  }
+
   // One shape for both groupings, so the chart and its click handler don't care
-  // which one is selected.
+  // which one is selected. The values follow Pallet View: a bar has to agree
+  // with the row it points at, so it is converted the same way — per material
+  // in material mode, and material-by-material across the load's own lines in
+  // load mode, since cases-per-pallet differs by item.
   const chartRows = useMemo(
     () =>
       chartGroup === 'load'
-        ? topLoads.map((load) => ({
-            label: formatOrderNumber(load.orderNumber),
-            totalOnHand: load.totalOnHand,
-            requested: load.requested,
-            material: load.worstMaterial,
-            load: load.orderNumber as string | null,
-          }))
+        ? topLoads.map((load) => {
+            const available = totalUnits(load.lines, (l) => l.available)
+            const requested = totalUnits(load.lines, (l) => l.requested)
+            return {
+              label: loadLabel(load),
+              totalOnHand: totalValue(available, palletView),
+              requested: totalValue(requested, palletView),
+              onHandText: formatTotal(available, palletView),
+              requestedText: formatTotal(requested, palletView),
+              material: load.worstMaterial,
+              load: load.key as string | null,
+            }
+          })
         : topMaterials.map((m) => ({
             label: m.material,
-            totalOnHand: m.totalOnHand,
-            requested: m.requested,
+            totalOnHand: qtyValue(m.totalOnHand, m.casesPerPallet, palletView),
+            requested: qtyValue(m.requested, m.casesPerPallet, palletView),
+            onHandText: formatQty(m.totalOnHand, m.casesPerPallet, palletView),
+            requestedText: formatQty(m.requested, m.casesPerPallet, palletView),
             material: m.material,
             load: null,
           })),
-    [chartGroup, topLoads, topMaterials],
+    [chartGroup, topLoads, topMaterials, palletView],
   )
 
   function revealMaterial(target: RevealTarget) {
@@ -326,16 +362,17 @@ function Home() {
   }
 
   // In load mode the bars are loads, so a click lands on the load's own row
-  // rather than on the material driving it.
-  function revealLoad(orderNumber: string) {
-    if (!orderNumber) return
-    if (!visibleLoads.some((l) => l.orderNumber === orderNumber)) {
+  // rather than on the material driving it. Loads are addressed by their key,
+  // not their freight order — many have none.
+  function revealLoad(key: string) {
+    if (!key) return
+    if (!visibleLoads.some((l) => l.key === key)) {
       setQuery('')
-      const load = loads.find((l) => l.orderNumber === orderNumber)
+      const load = loads.find((l) => l.key === key)
       if (shortfallsOnly && load && load.variance >= 0) setShortfallsOnly(false)
     }
-    setExpandedLoad(orderNumber)
-    setPendingReveal({ material: '', load: orderNumber })
+    setExpandedLoad(key)
+    setPendingReveal({ material: '', load: key })
   }
 
   // Switching the view swaps one kind of row for another, so whatever was open
@@ -386,6 +423,15 @@ function Home() {
       },
     ],
   }
+
+  // Left to itself Chart.js rounds the axis floor down to a whole tick step, so
+  // a single -3 bar drags the baseline to -2000 and every other bar flattens.
+  // Pin the floor to the actual smallest value instead (or 0 when nothing is
+  // negative), so the axis only ever descends as far as the data really does.
+  const chartMin = useMemo(() => {
+    const values = chartRows.flatMap((r) => [r.totalOnHand, r.requested])
+    return Math.min(0, ...values)
+  }, [chartRows])
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -574,8 +620,11 @@ function Home() {
                     </h2>
                     <p className="text-xs text-gray-400 mt-1 max-w-2xl">
                       {loadView
-                        ? 'Grouped by load number, filled in ship-date order: the stock a load can draw on is what is left after every earlier load has taken its share, so the two bars are that load’s own cases — what it can get against what it asks for. Click a bar to jump to that load’s row in the table below.'
+                        ? 'Grouped by load number, filled in ship-date order: the stock a load can draw on is what is left after every earlier load has taken its share, so the two bars are that load’s own demand — what it can get against what it asks for. A load with no freight order is labelled by its Customer PO. Click a bar to jump to that load’s row in the table below.'
                         : 'Grouped by material number. Click a bar to jump to that material’s row in the table below.'}
+                      {palletView
+                        ? ' Bars follow Pallet View; materials with no footprint stay in cases.'
+                        : ''}
                     </p>
                   </div>
                   {/* View controls: the grouping drives the table as well as the
@@ -647,6 +696,33 @@ function Home() {
                         </button>
                       )}
                     </div>
+                    {/* Shipping condition (column T) on the outbound loads
+                        export — both are stored, so either can be read. */}
+                    <div>
+                      <span className="block text-xs font-medium text-gray-500 mb-1">
+                        Shipping condition
+                      </span>
+                      <div className="inline-flex shrink-0 rounded-lg bg-gray-100 p-1">
+                        {SHIPPING_CONDITIONS.map((option) => {
+                          const active = condition === option.value
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              onClick={() => setCondition(option.value)}
+                              aria-pressed={active}
+                              className={`inline-flex items-center gap-2 text-sm font-medium rounded-md px-3 py-1 transition-colors ${
+                                active
+                                  ? 'bg-white text-gray-900 shadow-sm'
+                                  : 'text-gray-500 hover:text-gray-900'
+                              }`}
+                            >
+                              {option.label}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
                     <button
                       type="button"
                       onClick={() => setChartOpen((v) => !v)}
@@ -671,13 +747,17 @@ function Home() {
                     range is set.
                   </p>
                 )}
-                {/* Grid rows animate cleanly whatever the chart's height. */}
+                {/* Only the clip animates. The canvas box below is a fixed
+                    height, because Chart.js watches its container with a
+                    ResizeObserver: animating the container's own height (the
+                    grid-rows trick) makes the chart re-lay out on every frame
+                    and fight the transition. */}
                 <div
-                  className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
-                    chartOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
+                  className={`overflow-hidden transition-[max-height,opacity] duration-300 ease-out ${
+                    chartOpen ? 'max-h-[420px] opacity-100' : 'max-h-0 opacity-0'
                   }`}
                 >
-                  <div className="overflow-hidden">
+                  <div className="h-[380px]">
                 {chartRows.length === 0 ? (
                   <p className="text-sm text-gray-400 py-8 text-center">
                     No load is short — every load’s materials have enough stock
@@ -688,26 +768,41 @@ function Home() {
                     data={chartData}
                     options={{
                       responsive: true,
+                      // The wrapper fixes the height, so the canvas fills it
+                      // rather than deriving one from its own aspect ratio.
+                      maintainAspectRatio: false,
                       plugins: {
                         legend: { position: 'bottom' },
                         tooltip: {
                           callbacks: {
+                            // The bars carry pallet numbers in pallet view, so
+                            // the tooltip has to name the unit it is showing.
+                            label: (item) => {
+                              const row = chartRows[item.dataIndex]
+                              if (!row) return item.formattedValue
+                              const value =
+                                item.datasetIndex === 0 ? row.onHandText : row.requestedText
+                              return `${item.dataset.label}: ${value}`
+                            },
                             afterTitle: (items) => {
                               if (chartGroup !== 'load') return ''
                               const load = topLoads[items[0]?.dataIndex ?? -1]
                               if (!load) return ''
+                              const short = totalUnits(load.lines, (l) => Math.abs(l.variance))
                               return [
                                 load.shipDate ? `Ships ${load.shipDate}` : 'No ship date',
                                 `${load.materials.length} material${
                                   load.materials.length === 1 ? '' : 's'
                                 }`,
-                                `short ${formatNumber(Math.abs(load.variance))}`,
+                                `short ${formatTotal(short, palletView)}`,
                               ].join(' · ')
                             },
                           },
                         },
                       },
-                      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+                      scales: {
+                        y: { min: chartMin, beginAtZero: chartMin === 0, ticks: { precision: 0 } },
+                      },
                       onClick: (_event, elements) => {
                         const clicked = elements[0]
                         if (!clicked) return
@@ -828,22 +923,23 @@ function Home() {
                     </thead>
                     <tbody>
                       {visibleLoads.map((load) => {
-                        const isOpen = expandedLoad === load.orderNumber
+                        const isOpen = expandedLoad === load.key
                         const flagged = load.variance < 0
-                        const isHighlighted = highlight?.load === load.orderNumber
+                        const isHighlighted = highlight?.load === load.key
                         // Pallet figures are built material by material, the
                         // same way the stat tiles do it.
                         const available = totalUnits(load.lines, (l) => l.available)
                         const needed = totalUnits(load.lines, (l) => l.requested)
                         const variance = totalUnits(load.lines, (l) => l.variance)
+                        const loadNumber = formatLoadNumber(load.orderNumber)
                         return (
-                          <Fragment key={load.orderNumber}>
+                          <Fragment key={load.key}>
                             <tr
                               ref={(el) => {
-                                loadRowRefs.current.set(load.orderNumber, el)
+                                loadRowRefs.current.set(load.key, el)
                               }}
                               onClick={() =>
-                                setExpandedLoad(isOpen ? null : load.orderNumber)
+                                setExpandedLoad(isOpen ? null : load.key)
                               }
                               className={`border-b border-gray-50 last:border-0 cursor-pointer transition-colors ${
                                 isHighlighted
@@ -859,10 +955,17 @@ function Home() {
                                 )}
                               </td>
                               <td className="py-2 pr-4 font-mono text-gray-900">
-                                {formatOrderNumber(load.orderNumber)}
+                                {loadNumber || (
+                                  // The export leaves the freight order blank on
+                                  // a lot of rows. Say so on the row itself; the
+                                  // PO beside it is what identifies the load.
+                                  <span className="text-gray-400 italic font-sans">
+                                    No load #
+                                  </span>
+                                )}
                               </td>
                               <td className="py-2 pr-4 text-gray-700">
-                                {load.customerPO || '—'}
+                                {formatCustomerPo(load.customerPO) || '—'}
                               </td>
                               <td className="py-2 pr-4 text-gray-700">
                                 {load.shipDate || '—'}
@@ -1093,6 +1196,49 @@ function Home() {
                                   </div>
                                 )}
                               </div>
+                              {/* What the schedule actually commits, and when.
+                                  Nothing in production means nothing to show. */}
+                              {row.inProduction > 0 &&
+                                (row.production.length > 0 ? (
+                                  <div className="mb-4">
+                                    <p className="text-xs font-semibold text-gray-500 mb-1">
+                                      Scheduled production
+                                    </p>
+                                    <table className="w-full text-xs">
+                                      <thead>
+                                        <tr className="text-left text-gray-400 border-b border-gray-200">
+                                          <th className="py-1 pr-4 font-medium">Date</th>
+                                          <th className="py-1 font-medium">Quantity</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {row.production.map((entry, i) => (
+                                          <tr
+                                            key={`${entry.date}-${i}`}
+                                            className="border-b border-gray-100 last:border-0"
+                                          >
+                                            <td className="py-1 pr-4 text-gray-700">
+                                              {entry.date || 'No date on the schedule'}
+                                            </td>
+                                            <td className="py-1 text-gray-700">
+                                              {formatQty(
+                                                entry.quantity,
+                                                row.casesPerPallet,
+                                                palletView,
+                                              )}
+                                            </td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                ) : (
+                                  <p className="text-xs text-gray-500 mb-4">
+                                    <span className="font-semibold">Scheduled production:</span>{' '}
+                                    {formatQty(row.inProduction, row.casesPerPallet, palletView)} —
+                                    the schedule rows carried no date.
+                                  </p>
+                                ))}
                               {row.deliveries.length === 0 ? (
                                 <p className="text-sm text-gray-400">
                                   No delivery lines for this material.
@@ -1102,7 +1248,7 @@ function Home() {
                                   <thead>
                                     <tr className="text-left text-gray-400 border-b border-gray-200">
                                       <SortHeader
-                                        label="Order #"
+                                        label="Load #"
                                         sortKey="orderNumber"
                                         state={deliverySort}
                                         onChange={setDeliverySort}
@@ -1153,10 +1299,14 @@ function Home() {
                                   </thead>
                                   <tbody>
                                     {sortDeliveries(row.deliveries, deliverySort).map((d, i) => {
+                                      // The highlight target is a load key, so
+                                      // the line has to be keyed the same way —
+                                      // a line with no freight order belongs to
+                                      // its PO's load, not to nothing.
                                       const isTargetLine =
                                         isHighlighted &&
                                         !!highlight?.load &&
-                                        d.orderNumber === highlight.load
+                                        deliveryLoadKey(d) === highlight.load
                                       return (
                                         <tr
                                           key={i}
@@ -1167,10 +1317,10 @@ function Home() {
                                           }`}
                                         >
                                           <td className="py-1 pr-4 text-gray-700">
-                                            {formatOrderNumber(d.orderNumber) || '—'}
+                                            {formatLoadNumber(d.orderNumber) || '—'}
                                           </td>
                                           <td className="py-1 pr-4 text-gray-700">
-                                            {d.customerPO || '—'}
+                                            {formatCustomerPo(d.customerPO) || '—'}
                                           </td>
                                           <td className="py-1 pr-4 text-gray-700">
                                             {d.plantName || '—'}

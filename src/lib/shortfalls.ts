@@ -35,6 +35,13 @@ export type LoadLine = {
 }
 
 export type LoadShortfall = {
+  /**
+   * What identifies this load for grouping, refs and highlighting: the freight
+   * order when there is one, otherwise the Customer PO. Never blank, never
+   * shared between two different loads.
+   */
+  key: string
+  /** Freight order (column P). Blank on the many rows the export leaves empty. */
   orderNumber: string
   /** Customer PO from the load's lines — the first non-empty one. */
   customerPO: string
@@ -60,6 +67,7 @@ export type LoadShortfall = {
 }
 
 type LoadEntry = {
+  key: string
   orderNumber: string
   customerPO: string
   /** Material number -> quantity this load asks for. */
@@ -83,6 +91,19 @@ function earliestDateKey(...texts: Array<string | undefined>): number {
   return best
 }
 
+// The export leaves the freight order blank on a large share of its rows, so it
+// cannot be the grouping key on its own — keying on it would fold hundreds of
+// unrelated deliveries into one "(no load #)" row and hide every PO in them.
+// The Customer PO identifies the load in that case. Returns '' for a line
+// carrying neither, which the grouper gives a key of its own.
+export function deliveryLoadKey(delivery: ShortfallDelivery): string {
+  const orderNumber = delivery.orderNumber?.trim()
+  if (orderNumber) return `load:${orderNumber}`
+  const customerPO = delivery.customerPO?.trim()
+  if (customerPO) return `po:${customerPO}`
+  return ''
+}
+
 export function groupShortfallsByLoad(
   materials: readonly ShortfallMaterial[],
 ): LoadShortfall[] {
@@ -96,20 +117,24 @@ export function groupShortfallsByLoad(
     ),
   )
 
+  let unidentified = 0
+
   for (const material of materials) {
     for (const delivery of material.deliveries) {
-      const orderNumber = delivery.orderNumber || '(no order #)'
-      let entry = byLoad.get(orderNumber)
+      const key = deliveryLoadKey(delivery) || `line:${unidentified}`
+      if (key.startsWith('line:')) unidentified += 1
+      let entry = byLoad.get(key)
       if (!entry) {
         entry = {
-          orderNumber,
+          key,
+          orderNumber: delivery.orderNumber?.trim() ?? '',
           customerPO: '',
           demand: new Map<string, number>(),
           requested: 0,
           dateKey: Number.POSITIVE_INFINITY,
           shipDate: '',
         }
-        byLoad.set(orderNumber, entry)
+        byLoad.set(key, entry)
       }
 
       // Lines on one load should agree on the PO; if they don't, the first
@@ -142,7 +167,7 @@ export function groupShortfallsByLoad(
 
   const ordered = [...byLoad.values()].sort((a, b) => {
     if (a.dateKey !== b.dateKey) return a.dateKey - b.dateKey
-    return a.orderNumber.localeCompare(b.orderNumber)
+    return a.key.localeCompare(b.key)
   })
 
   const loads: LoadShortfall[] = []
@@ -178,6 +203,7 @@ export function groupShortfallsByLoad(
     const materialNumbers = [...entry.demand.keys()]
 
     loads.push({
+      key: entry.key,
       orderNumber: entry.orderNumber,
       customerPO: entry.customerPO,
       materials: materialNumbers,
