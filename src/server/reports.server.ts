@@ -19,6 +19,7 @@ export type ParsedLine = {
   soldTo?: string
   loadingDate?: string
   shipDate?: string
+  shippingCondition?: string
   productionDate?: string
 }
 
@@ -36,9 +37,11 @@ const REPORT_COLUMNS: Record<
     material: string
     name: string
     quantity: string
-    condition?: { column: string; equals: string }
+    /** Shipping condition: the row is kept only if its value is in `allow`. */
+    condition?: { column: string; allow: readonly string[] }
     orderNumber?: string
-    customerPO?: string
+    /** Candidate columns for the Customer PO, tried in order; first non-empty wins. */
+    customerPO?: readonly string[]
     plantName?: string
     soldTo?: string
     loadingDate?: string
@@ -53,13 +56,18 @@ const REPORT_COLUMNS: Record<
     material: 'Q',
     name: 'R',
     quantity: 'S',
-    condition: { column: 'T', equals: '02' },
-    // UNCONFIRMED: column L is reported to hold the Customer PO rather than the
-    // sales document number, but the source export was not available to check.
-    // Both fields read L until the header row can be confirmed; if L turns out
-    // to be the PO only, point orderNumber at the sales-document column here.
-    orderNumber: 'L',
-    customerPO: 'L',
+    // Both conditions are stored so the dashboard selector can switch between
+    // them; anything else is still stray data and is dropped at upload.
+    condition: { column: 'T', allow: ['01', '02'] },
+    // Column P is the freight order — the load number. It is blank on a good
+    // share of rows (every condition-02 row and some condition-01 ones), which
+    // is why a load is identified by its Customer PO when P is empty.
+    orderNumber: 'P',
+    // The PO sits in K on condition-02 rows and in L on condition-01 rows, and
+    // the export leaves the other one blank, so the first non-empty of the two
+    // is the Customer PO. (K is headed "Customer PO"; L is headed "Order
+    // Number" but carries the 43… PO on those rows.)
+    customerPO: ['K', 'L'],
     plantName: 'W',
     soldTo: 'Y',
     loadingDate: 'AE',
@@ -112,7 +120,7 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
   const quantityIdx = columnLetterToIndex(columns.quantity)
   const conditionIdx = columns.condition ? columnLetterToIndex(columns.condition.column) : null
   const orderNumberIdx = columns.orderNumber ? columnLetterToIndex(columns.orderNumber) : null
-  const customerPOIdx = columns.customerPO ? columnLetterToIndex(columns.customerPO) : null
+  const customerPOIdxs = columns.customerPO?.map(columnLetterToIndex) ?? null
   const plantNameIdx = columns.plantName ? columnLetterToIndex(columns.plantName) : null
   const soldToIdx = columns.soldTo ? columnLetterToIndex(columns.soldTo) : null
   const loadingDateIdx = columns.loadingDate ? columnLetterToIndex(columns.loadingDate) : null
@@ -135,9 +143,10 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
     const material = cellToString(row[materialIdx])
     if (!/^[0-9]+$/.test(material)) continue // skips header row and blanks
 
+    let shippingCondition: string | undefined
     if (columns.condition && conditionIdx !== null) {
-      const conditionValue = cellToString(row[conditionIdx])
-      if (conditionValue !== columns.condition.equals) continue
+      shippingCondition = cellToString(row[conditionIdx])
+      if (!columns.condition.allow.includes(shippingCondition)) continue
     }
 
     const quantity = cellToNumber(row[quantityIdx])
@@ -148,11 +157,14 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
       materialName: cellToString(row[nameIdx]),
       quantity,
       orderNumber: orderNumberIdx !== null ? cellToString(row[orderNumberIdx]) : undefined,
-      customerPO: customerPOIdx !== null ? cellToString(row[customerPOIdx]) : undefined,
+      customerPO: customerPOIdxs
+        ? customerPOIdxs.map((i) => cellToString(row[i])).find(Boolean) ?? ''
+        : undefined,
       plantName: plantNameIdx !== null ? cellToString(row[plantNameIdx]) : undefined,
       soldTo: soldToIdx !== null ? cellToString(row[soldToIdx]) : undefined,
       loadingDate: loadingDateIdx !== null ? cellToDateString(row[loadingDateIdx]) : undefined,
       shipDate: shipDateIdx !== null ? cellToDateString(row[shipDateIdx]) : undefined,
+      shippingCondition,
       // Rows above the first date heading get nothing rather than a guess.
       productionDate: dateIdx !== null ? lastDate : undefined,
     })
@@ -183,6 +195,7 @@ export async function saveReport(type: ReportType, label: string, lines: ParsedL
         soldTo: line.soldTo,
         loadingDate: line.loadingDate,
         shipDate: line.shipDate,
+        shippingCondition: line.shippingCondition,
         productionDate: line.productionDate,
       })),
     )
@@ -294,6 +307,8 @@ export type DeliveryDetail = {
   soldTo: string
   loadingDate: string
   shipDate: string
+  /** Column T: '01' or '02'. Lines stored before this was captured read as '02'. */
+  shippingCondition: string
   quantity: number
 }
 
@@ -360,6 +375,9 @@ export function computeMaterialSummary(
       soldTo: line.soldTo ?? '',
       loadingDate: line.loadingDate ?? '',
       shipDate: line.shipDate ?? '',
+      // An upload from before the condition was stored defaults to '02', which
+      // is what the app showed at the time, so old data doesn't vanish.
+      shippingCondition: line.shippingCondition || '02',
       quantity: line.quantity,
     })
     deliveries.set(line.material, list)

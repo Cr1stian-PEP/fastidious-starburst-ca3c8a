@@ -172,34 +172,61 @@ export function filterAndSortLoads<T extends LoadSortRow>(
       return dir * (ka - kb)
     }
 
-    if (sort.key === 'orderNumber' || sort.key === 'customerPO') {
-      return dir * a[sort.key].localeCompare(b[sort.key])
+    if (sort.key === 'orderNumber') {
+      // Many loads have no freight order at all. Keep those together at the
+      // bottom in both directions rather than letting the empty string sort to
+      // the top when the direction flips.
+      const a0 = a.orderNumber.trim()
+      const b0 = b.orderNumber.trim()
+      if (!a0 && !b0) return 0
+      if (!a0) return 1
+      if (!b0) return -1
+      return dir * a0.localeCompare(b0)
+    }
+
+    if (sort.key === 'customerPO') {
+      return dir * a.customerPO.localeCompare(b.customerPO)
     }
 
     return dir * (a[sort.key] - b[sort.key])
   })
 }
 
-// A ship-date range narrows the demand side of the report: only delivery lines
-// shipping inside the window count, so `requested` and `variance` are rebuilt
-// from the survivors. Stock isn't dated, so it is left exactly as it was.
-export function filterMaterialsByShipDate<
+// The shipping condition the demand side is read at. '02' is the default view,
+// matching what the app showed before the selector existed.
+export type ShippingCondition = '01' | '02' | 'both'
+
+// A ship-date range and a shipping condition both narrow the demand side of the
+// report: only delivery lines that survive both count, so `requested` and
+// `variance` are rebuilt from the survivors. Stock isn't dated or conditioned,
+// so it is left exactly as it was.
+export function filterMaterialsByDelivery<
   T extends {
     requested: number
     variance: number
     totalOnHand: number
-    deliveries: Array<{ shipDate: string; quantity: number }>
+    deliveries: Array<{ shipDate: string; quantity: number; shippingCondition?: string }>
   },
->(materials: readonly T[], from: string, to: string): T[] {
-  if (!from && !to) return materials as T[]
+>(
+  materials: readonly T[],
+  options: { from: string; to: string; condition: ShippingCondition },
+): T[] {
+  const { from, to, condition } = options
+  if (!from && !to && condition === 'both') return materials as T[]
 
   // dateSortKey returns a Date.UTC value, so the date inputs parse straight
   // onto the same scale. Both ends are inclusive.
   const min = from ? Date.parse(`${from}T00:00:00Z`) : Number.NEGATIVE_INFINITY
   const max = to ? Date.parse(`${to}T00:00:00Z`) : Number.POSITIVE_INFINITY
+  const rangeActive = Boolean(from || to)
 
   return materials.map((material) => {
     const deliveries = material.deliveries.filter((d) => {
+      // Lines stored before the condition was captured read as '02', which is
+      // what the app showed when they were uploaded.
+      if (condition !== 'both' && (d.shippingCondition || '02') !== condition) return false
+      if (!rangeActive) return true
+
       const key = dateSortKey(d.shipDate)
       // An undated line can't be shown to fall inside the window, so it drops.
       if (!Number.isFinite(key)) return false
