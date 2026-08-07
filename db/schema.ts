@@ -15,10 +15,13 @@ export const reportLines = pgTable("report_lines", {
   quantity: doublePrecision("quantity").notNull(),
   // delivery-only fields, used for the per-material expand view
   orderNumber: text("order_number"),
+  customerPo: text("customer_po"),
   plantName: text("plant_name"),
   soldTo: text("sold_to"),
   loadingDate: text("loading_date"),
   shipDate: text("ship_date"),
+  // production-only: the date block the row sits under in the schedule
+  productionDate: text("production_date"),
 });
 
 // User edits to the pallet footprint key. The generated

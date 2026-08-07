@@ -4,7 +4,14 @@
 export type UnitRow = { casesPerPallet: number | null }
 
 export function formatNumber(n: number) {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+  return n.toLocaleString(undefined, { maximumFractionDigits: 0 })
+}
+
+// Order numbers arrive padded — the meaningful identifier is the leading run,
+// and the trailing filler is noise in a table cell.
+export function formatOrderNumber(orderNumber: string) {
+  const trimmed = orderNumber.trim()
+  return trimmed.length > 9 ? trimmed.slice(0, 9) : trimmed
 }
 
 // One material's quantity. Materials with no footprint key match cannot be

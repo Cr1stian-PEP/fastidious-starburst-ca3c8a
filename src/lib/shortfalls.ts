@@ -5,6 +5,7 @@ import { dateSortKey } from './table-sort.js'
 
 export type ShortfallDelivery = {
   orderNumber: string
+  customerPO?: string
   quantity: number
   loadingDate?: string
   shipDate?: string
@@ -16,13 +17,31 @@ export type ShortfallMaterial = {
   totalOnHand: number
   requested: number
   variance: number
+  casesPerPallet?: number | null
   deliveries: readonly ShortfallDelivery[]
+}
+
+/** One material's share of a load, as the allocation settled it. */
+export type LoadLine = {
+  material: string
+  materialName: string
+  /** What this load asks for. */
+  requested: number
+  /** What the allocation gave it. */
+  available: number
+  /** `available - requested`. */
+  variance: number
+  casesPerPallet: number | null
 }
 
 export type LoadShortfall = {
   orderNumber: string
+  /** Customer PO from the load's lines — the first non-empty one. */
+  customerPO: string
   /** Distinct material numbers this load needs. */
   materials: string[]
+  /** Per-material breakdown behind the totals below. */
+  lines: LoadLine[]
   /** Total quantity the load asks for across all its lines. */
   requested: number
   /**
@@ -42,6 +61,7 @@ export type LoadShortfall = {
 
 type LoadEntry = {
   orderNumber: string
+  customerPO: string
   /** Material number -> quantity this load asks for. */
   demand: Map<string, number>
   requested: number
@@ -67,6 +87,14 @@ export function groupShortfallsByLoad(
   materials: readonly ShortfallMaterial[],
 ): LoadShortfall[] {
   const byLoad = new Map<string, LoadEntry>()
+  // Names and footprints live on the material, not the delivery line, so the
+  // per-load breakdown reads them back out here.
+  const meta = new Map(
+    materials.map(
+      (m) =>
+        [m.material, { name: m.materialName, casesPerPallet: m.casesPerPallet ?? null }] as const,
+    ),
+  )
 
   for (const material of materials) {
     for (const delivery of material.deliveries) {
@@ -75,6 +103,7 @@ export function groupShortfallsByLoad(
       if (!entry) {
         entry = {
           orderNumber,
+          customerPO: '',
           demand: new Map<string, number>(),
           requested: 0,
           dateKey: Number.POSITIVE_INFINITY,
@@ -82,6 +111,10 @@ export function groupShortfallsByLoad(
         }
         byLoad.set(orderNumber, entry)
       }
+
+      // Lines on one load should agree on the PO; if they don't, the first
+      // non-empty one stands for the load.
+      if (!entry.customerPO && delivery.customerPO) entry.customerPO = delivery.customerPO
 
       entry.demand.set(
         material.material,
@@ -118,12 +151,22 @@ export function groupShortfallsByLoad(
     let totalOnHand = 0
     let worstMaterial = ''
     let worstShort = 0
+    const lines: LoadLine[] = []
 
     for (const [material, demand] of entry.demand) {
       const stock = remaining.get(material) ?? 0
       const covered = Math.min(demand, stock)
       remaining.set(material, stock - covered)
       totalOnHand += covered
+
+      lines.push({
+        material,
+        materialName: meta.get(material)?.name ?? material,
+        requested: demand,
+        available: covered,
+        variance: covered - demand,
+        casesPerPallet: meta.get(material)?.casesPerPallet ?? null,
+      })
 
       const short = demand - covered
       if (short > worstShort) {
@@ -136,7 +179,9 @@ export function groupShortfallsByLoad(
 
     loads.push({
       orderNumber: entry.orderNumber,
+      customerPO: entry.customerPO,
       materials: materialNumbers,
+      lines,
       requested: entry.requested,
       totalOnHand,
       variance: totalOnHand - entry.requested,
@@ -150,12 +195,21 @@ export function groupShortfallsByLoad(
   return loads
 }
 
+/**
+ * Every load, in allocation order. The load table reads this directly; the
+ * chart filters it down. Both go through one allocation pass so the numbers
+ * can't disagree.
+ */
+export function summarizeLoads(materials: readonly ShortfallMaterial[]): LoadShortfall[] {
+  return groupShortfallsByLoad(materials)
+}
+
 /** Worst shortfall first. Only rows that are actually short are worth charting. */
 export function topShortfallLoads(
   materials: readonly ShortfallMaterial[],
   limit: number,
 ): LoadShortfall[] {
-  return groupShortfallsByLoad(materials)
+  return summarizeLoads(materials)
     .filter((load) => load.variance < 0)
     .sort((a, b) => a.variance - b.variance)
     .slice(0, limit)

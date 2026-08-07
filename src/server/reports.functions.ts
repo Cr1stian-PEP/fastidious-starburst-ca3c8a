@@ -10,6 +10,7 @@ import {
   listFootprints,
   upsertFootprint,
   deleteFootprintOverride,
+  listProductionSchedule,
   REPORT_TYPES,
   type ReportType,
 } from './reports.server.js'
@@ -55,6 +56,10 @@ export const removeReport = createServerFn({ method: 'POST' })
 
 export const getFootprints = createServerFn({ method: 'GET' }).handler(async () =>
   listFootprints(),
+)
+
+export const getProductionSchedule = createServerFn({ method: 'GET' }).handler(async () =>
+  listProductionSchedule(),
 )
 
 export const saveFootprint = createServerFn({ method: 'POST' })

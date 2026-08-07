@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx'
 import { db } from '../../db/index.js'
 import { reports, reportLines, materialFootprints } from '../../db/schema.js'
 import footprintKey from './data/material-footprints.json'
-import { compareMaterialNumber, sortDeliveries } from '../lib/table-sort.js'
+import { compareMaterialNumber, dateSortKey, sortDeliveries } from '../lib/table-sort.js'
 
 export type ReportType = 'production' | 'materials' | 'delivery'
 
@@ -14,10 +14,12 @@ export type ParsedLine = {
   materialName: string
   quantity: number
   orderNumber?: string
+  customerPO?: string
   plantName?: string
   soldTo?: string
   loadingDate?: string
   shipDate?: string
+  productionDate?: string
 }
 
 function columnLetterToIndex(letters: string): number {
@@ -36,20 +38,28 @@ const REPORT_COLUMNS: Record<
     quantity: string
     condition?: { column: string; equals: string }
     orderNumber?: string
+    customerPO?: string
     plantName?: string
     soldTo?: string
     loadingDate?: string
     shipDate?: string
+    /** Production only: a date that governs the block of rows beneath it. */
+    date?: string
   }
 > = {
-  production: { material: 'D', name: 'F', quantity: 'G' },
+  production: { material: 'D', name: 'F', quantity: 'G', date: 'B' },
   materials: { material: 'A', name: 'B', quantity: 'C' },
   delivery: {
     material: 'Q',
     name: 'R',
     quantity: 'S',
     condition: { column: 'T', equals: '02' },
+    // UNCONFIRMED: column L is reported to hold the Customer PO rather than the
+    // sales document number, but the source export was not available to check.
+    // Both fields read L until the header row can be confirmed; if L turns out
+    // to be the PO only, point orderNumber at the sales-document column here.
     orderNumber: 'L',
+    customerPO: 'L',
     plantName: 'W',
     soldTo: 'Y',
     loadingDate: 'AE',
@@ -102,14 +112,26 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
   const quantityIdx = columnLetterToIndex(columns.quantity)
   const conditionIdx = columns.condition ? columnLetterToIndex(columns.condition.column) : null
   const orderNumberIdx = columns.orderNumber ? columnLetterToIndex(columns.orderNumber) : null
+  const customerPOIdx = columns.customerPO ? columnLetterToIndex(columns.customerPO) : null
   const plantNameIdx = columns.plantName ? columnLetterToIndex(columns.plantName) : null
   const soldToIdx = columns.soldTo ? columnLetterToIndex(columns.soldTo) : null
   const loadingDateIdx = columns.loadingDate ? columnLetterToIndex(columns.loadingDate) : null
   const shipDateIdx = columns.shipDate ? columnLetterToIndex(columns.shipDate) : null
+  const dateIdx = columns.date ? columnLetterToIndex(columns.date) : null
 
   const result: ParsedLine[] = []
+  // The production schedule prints its date once at the top of a block and
+  // leaves the cells beneath it blank, so the date has to carry downward. That
+  // heading row usually has no material number, which means the date must be
+  // read *before* the material guard skips the row.
+  let lastDate = ''
 
   for (const row of rows) {
+    if (dateIdx !== null) {
+      const cell = cellToDateString(row[dateIdx])
+      if (cell) lastDate = cell
+    }
+
     const material = cellToString(row[materialIdx])
     if (!/^[0-9]+$/.test(material)) continue // skips header row and blanks
 
@@ -126,10 +148,13 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
       materialName: cellToString(row[nameIdx]),
       quantity,
       orderNumber: orderNumberIdx !== null ? cellToString(row[orderNumberIdx]) : undefined,
+      customerPO: customerPOIdx !== null ? cellToString(row[customerPOIdx]) : undefined,
       plantName: plantNameIdx !== null ? cellToString(row[plantNameIdx]) : undefined,
       soldTo: soldToIdx !== null ? cellToString(row[soldToIdx]) : undefined,
       loadingDate: loadingDateIdx !== null ? cellToDateString(row[loadingDateIdx]) : undefined,
       shipDate: shipDateIdx !== null ? cellToDateString(row[shipDateIdx]) : undefined,
+      // Rows above the first date heading get nothing rather than a guess.
+      productionDate: dateIdx !== null ? lastDate : undefined,
     })
   }
 
@@ -153,10 +178,12 @@ export async function saveReport(type: ReportType, label: string, lines: ParsedL
         materialName: line.materialName,
         quantity: line.quantity,
         orderNumber: line.orderNumber,
+        customerPo: line.customerPO,
         plantName: line.plantName,
         soldTo: line.soldTo,
         loadingDate: line.loadingDate,
         shipDate: line.shipDate,
+        productionDate: line.productionDate,
       })),
     )
   }
@@ -262,10 +289,17 @@ export async function deleteFootprintOverride(material: string) {
 
 export type DeliveryDetail = {
   orderNumber: string
+  customerPO: string
   plantName: string
   soldTo: string
   loadingDate: string
   shipDate: string
+  quantity: number
+}
+
+/** One date block's contribution to a material's scheduled production. */
+export type ProductionDetail = {
+  date: string
   quantity: number
 }
 
@@ -279,6 +313,7 @@ export type MaterialRow = {
   variance: number
   casesPerPallet: number | null
   deliveries: DeliveryDetail[]
+  production: ProductionDetail[]
 }
 
 export function computeMaterialSummary(
@@ -294,12 +329,20 @@ export function computeMaterialSummary(
   const finished = new Map<string, number>()
   const requested = new Map<string, number>()
   const deliveries = new Map<string, DeliveryDetail[]>()
+  // Material -> production date -> quantity, so a material scheduled twice on
+  // the same day reads as one entry.
+  const production = new Map<string, Map<string, number>>()
 
   // Name precedence: materials > production > delivery, per the materials report
   // being the canonical source for material names.
   for (const line of productionLines) {
     inProduction.set(line.material, (inProduction.get(line.material) ?? 0) + line.quantity)
     if (!names.has(line.material) && line.materialName) names.set(line.material, line.materialName)
+
+    const byDate = production.get(line.material) ?? new Map<string, number>()
+    const date = line.productionDate ?? ''
+    byDate.set(date, (byDate.get(date) ?? 0) + line.quantity)
+    production.set(line.material, byDate)
   }
   for (const line of materialsLines) {
     finished.set(line.material, (finished.get(line.material) ?? 0) + line.quantity)
@@ -312,6 +355,7 @@ export function computeMaterialSummary(
     const list = deliveries.get(line.material) ?? []
     list.push({
       orderNumber: line.orderNumber ?? '',
+      customerPO: line.customerPo ?? '',
       plantName: line.plantName ?? '',
       soldTo: line.soldTo ?? '',
       loadingDate: line.loadingDate ?? '',
@@ -344,9 +388,55 @@ export function computeMaterialSummary(
         key: 'shipDate',
         dir: 'asc',
       }),
+      production: [...(production.get(material)?.entries() ?? [])]
+        .map(([date, quantity]) => ({ date, quantity }))
+        .sort((a, b) => {
+          const ka = dateSortKey(a.date)
+          const kb = dateSortKey(b.date)
+          if (ka === kb) return 0
+          // Undated rows sit last, the way the tables treat blank dates.
+          if (!Number.isFinite(ka)) return 1
+          if (!Number.isFinite(kb)) return -1
+          return ka - kb
+        }),
     })
   }
 
   // Ordered by material number, matching how these reports are normally read.
   return rows.sort((a, b) => compareMaterialNumber(a.material, b.material))
+}
+
+export type ProductionScheduleLine = {
+  material: string
+  materialName: string
+  quantity: number
+  date: string
+}
+
+// A straight read of the uploaded production schedule, in the order the plant
+// works it: earliest date first, materials in number order within a date.
+export async function listProductionSchedule(): Promise<ProductionScheduleLine[]> {
+  const [report] = await db.select().from(reports).where(eq(reports.type, 'production'))
+  if (!report) return []
+
+  const lines = await db.select().from(reportLines).where(eq(reportLines.reportId, report.id))
+
+  return lines
+    .map((line) => ({
+      material: line.material,
+      materialName: line.materialName,
+      quantity: line.quantity,
+      date: line.productionDate ?? '',
+    }))
+    .sort((a, b) => {
+      const ka = dateSortKey(a.date)
+      const kb = dateSortKey(b.date)
+      if (ka !== kb) {
+        // Undated rows last in either case, so they don't lead the schedule.
+        if (!Number.isFinite(ka)) return 1
+        if (!Number.isFinite(kb)) return -1
+        return ka - kb
+      }
+      return compareMaterialNumber(a.material, b.material)
+    })
 }
