@@ -6,11 +6,13 @@ import {
   clearReport,
   getAllReports,
   computeMaterialSummary,
+  deliveryNeedsReupload,
   resolveFootprints,
   listFootprints,
   upsertFootprint,
   deleteFootprintOverride,
   listProductionSchedule,
+  buildVarianceExport,
   REPORT_TYPES,
   type ReportType,
 } from './reports.server.js'
@@ -31,6 +33,10 @@ export const getVarianceData = createServerFn({ method: 'GET' }).handler(async (
       lineCount: r.lines.length,
     })),
     materials,
+    // Load numbers are frozen at upload time, so an outbound export uploaded
+    // before the K/L mapping still shows the old column-P numbers until it is
+    // uploaded again. The dashboard says so rather than showing them quietly.
+    deliveryNeedsReupload: deliveryNeedsReupload(reportsWithLines),
   }
 })
 
@@ -84,3 +90,42 @@ export const saveFootprint = createServerFn({ method: 'POST' })
 export const resetFootprint = createServerFn({ method: 'POST' })
   .inputValidator(z.object({ material: z.string().trim().min(1).max(40) }))
   .handler(async ({ data }) => deleteFootprintOverride(data.material))
+
+const sortDir = z.enum(['asc', 'desc'])
+
+// The dashboard's whole view state, so the workbook can be rebuilt server-side
+// as the exact report on screen rather than trusting rows sent up from the tab.
+export const exportVarianceWorkbook = createServerFn({ method: 'POST' })
+  .inputValidator(
+    z.object({
+      view: z.enum(['material', 'load']),
+      palletView: z.boolean(),
+      query: z.string().max(200),
+      shortfallsOnly: z.boolean(),
+      // Blank on either end is open-ended, matching the date inputs.
+      from: z.string().max(10),
+      to: z.string().max(10),
+      condition: z.enum(['01', '02', 'both']),
+      materialSort: z.object({
+        key: z.enum(['material', 'materialName', 'totalOnHand', 'requested', 'variance']),
+        dir: sortDir,
+      }),
+      loadSort: z.object({
+        key: z.enum([
+          'orderNumber',
+          'customerPO',
+          'shipDate',
+          'materialCount',
+          'totalOnHand',
+          'requested',
+          'variance',
+        ]),
+        dir: sortDir,
+      }),
+      // Both stamps come from the browser so the file is dated in the reader's
+      // own time zone rather than the server's.
+      generatedAt: z.string().max(80),
+      dateStamp: z.string().regex(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/),
+    }),
+  )
+  .handler(async ({ data }) => buildVarianceExport(data))

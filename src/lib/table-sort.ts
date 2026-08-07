@@ -177,9 +177,9 @@ export function filterAndSortLoads<T extends LoadSortRow>(
     }
 
     if (sort.key === 'orderNumber') {
-      // Many loads have no freight order at all. Keep those together at the
-      // bottom in both directions rather than letting the empty string sort to
-      // the top when the direction flips.
+      // Condition-01 pickups have no load number at all. Keep those together at
+      // the bottom in both directions rather than letting the empty string sort
+      // to the top when the direction flips.
       const a0 = a.orderNumber.trim()
       const b0 = b.orderNumber.trim()
       if (!a0 && !b0) return 0

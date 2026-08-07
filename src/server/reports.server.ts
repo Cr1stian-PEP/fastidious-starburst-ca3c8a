@@ -3,7 +3,25 @@ import * as XLSX from 'xlsx'
 import { db } from '../../db/index.js'
 import { reports, reportLines, materialFootprints } from '../../db/schema.js'
 import footprintKey from './data/material-footprints.json'
-import { compareMaterialNumber, dateSortKey, sortDeliveries } from '../lib/table-sort.js'
+import {
+  compareMaterialNumber,
+  dateSortKey,
+  filterAndSortLoads,
+  filterAndSortMaterials,
+  filterMaterialsByDelivery,
+  sortDeliveries,
+  type LoadSortKey,
+  type MaterialSortKey,
+  type ShippingCondition,
+  type SortState,
+} from '../lib/table-sort.js'
+import { summarizeLoads } from '../lib/shortfalls.js'
+import {
+  buildLoadExport,
+  buildMaterialExport,
+  type ExportDocument,
+  type ExportView,
+} from '../lib/report-export.js'
 
 export type ReportType = 'production' | 'materials' | 'delivery'
 
@@ -39,9 +57,13 @@ const REPORT_COLUMNS: Record<
     quantity: string
     /** Shipping condition: the row is kept only if its value is in `allow`. */
     condition?: { column: string; allow: readonly string[] }
-    orderNumber?: string
-    /** Candidate columns for the Customer PO, tried in order; first non-empty wins. */
-    customerPO?: readonly string[]
+    /**
+     * Which columns hold the load number and the Customer PO, keyed by the
+     * row's shipping condition — the same two columns mean different things
+     * depending on it. A missing `orderNumber` means that condition has no
+     * load number at all.
+     */
+    byCondition?: Record<string, { orderNumber?: string; customerPO: string }>
     plantName?: string
     soldTo?: string
     loadingDate?: string
@@ -59,15 +81,14 @@ const REPORT_COLUMNS: Record<
     // Both conditions are stored so the dashboard selector can switch between
     // them; anything else is still stray data and is dropped at upload.
     condition: { column: 'T', allow: ['01', '02'] },
-    // Column P is the freight order — the load number. It is blank on a good
-    // share of rows (every condition-02 row and some condition-01 ones), which
-    // is why a load is identified by its Customer PO when P is empty.
-    orderNumber: 'P',
-    // The PO sits in K on condition-02 rows and in L on condition-01 rows, and
-    // the export leaves the other one blank, so the first non-empty of the two
-    // is the Customer PO. (K is headed "Customer PO"; L is headed "Order
-    // Number" but carries the 43… PO on those rows.)
-    customerPO: ['K', 'L'],
+    // The load number and the Customer PO both come out of columns K and L, and
+    // which is which depends on the shipping condition: an 01 row is a customer
+    // pickup with no load of its own, so L is simply its PO; an 02 row is a
+    // delivery, where L is the load number and K the PO it belongs to.
+    byCondition: {
+      '01': { customerPO: 'L' },
+      '02': { orderNumber: 'L', customerPO: 'K' },
+    },
     plantName: 'W',
     soldTo: 'Y',
     loadingDate: 'AE',
@@ -119,8 +140,19 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
   const nameIdx = columnLetterToIndex(columns.name)
   const quantityIdx = columnLetterToIndex(columns.quantity)
   const conditionIdx = columns.condition ? columnLetterToIndex(columns.condition.column) : null
-  const orderNumberIdx = columns.orderNumber ? columnLetterToIndex(columns.orderNumber) : null
-  const customerPOIdxs = columns.customerPO?.map(columnLetterToIndex) ?? null
+  // Load number / Customer PO columns resolved per shipping condition, so the
+  // row loop only has to look up the condition it just read.
+  const byCondition = columns.byCondition
+    ? new Map(
+        Object.entries(columns.byCondition).map(([value, spec]) => [
+          value,
+          {
+            orderNumber: spec.orderNumber ? columnLetterToIndex(spec.orderNumber) : null,
+            customerPO: columnLetterToIndex(spec.customerPO),
+          },
+        ]),
+      )
+    : null
   const plantNameIdx = columns.plantName ? columnLetterToIndex(columns.plantName) : null
   const soldToIdx = columns.soldTo ? columnLetterToIndex(columns.soldTo) : null
   const loadingDateIdx = columns.loadingDate ? columnLetterToIndex(columns.loadingDate) : null
@@ -152,13 +184,25 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
     const quantity = cellToNumber(row[quantityIdx])
     if (Number.isNaN(quantity)) continue
 
+    // An 01 row has no load number, so it stays an empty string rather than
+    // borrowing a column that means something else on that row.
+    const poColumns = byCondition
+      ? byCondition.get(shippingCondition ?? '') ?? { orderNumber: null, customerPO: null }
+      : null
+
     result.push({
       material,
       materialName: cellToString(row[nameIdx]),
       quantity,
-      orderNumber: orderNumberIdx !== null ? cellToString(row[orderNumberIdx]) : undefined,
-      customerPO: customerPOIdxs
-        ? customerPOIdxs.map((i) => cellToString(row[i])).find(Boolean) ?? ''
+      orderNumber: poColumns
+        ? poColumns.orderNumber !== null
+          ? cellToString(row[poColumns.orderNumber])
+          : ''
+        : undefined,
+      customerPO: poColumns
+        ? poColumns.customerPO !== null
+          ? cellToString(row[poColumns.customerPO])
+          : ''
         : undefined,
       plantName: plantNameIdx !== null ? cellToString(row[plantNameIdx]) : undefined,
       soldTo: soldToIdx !== null ? cellToString(row[soldToIdx]) : undefined,
@@ -212,6 +256,28 @@ export async function getAllReports() {
     ...report,
     lines: allLines.filter((line) => line.reportId === report.id),
   }))
+}
+
+export type StoredReport = Awaited<ReturnType<typeof getAllReports>>[number]
+
+// Load numbers are decided at upload time, so a delivery report stored before
+// the K/L mapping still holds column P in `order_number` — a zero-padded
+// freight order, and one that sits on rows the parser now leaves blank. Neither
+// is producible today, so either one means what is on screen came out of the
+// old mapping and the export has to be re-uploaded to pick up the new one.
+export function deliveryNeedsReupload(stored: readonly StoredReport[]) {
+  const delivery = stored.find((report) => report.type === 'delivery')
+  if (!delivery) return false
+
+  return delivery.lines.some((line) => {
+    const orderNumber = line.orderNumber?.trim()
+    if (!orderNumber) return false
+    // A condition-01 pickup never carries a load number now. (A line stored
+    // before the condition column existed reads as 02, as it does everywhere.)
+    if ((line.shippingCondition?.trim() || '02') === '01') return true
+    // Column L is a plain 10-digit value; column P was padded out to 20.
+    return orderNumber.length > 10
+  })
 }
 
 export async function clearReport(type: ReportType) {
@@ -429,6 +495,8 @@ export type ProductionScheduleLine = {
   materialName: string
   quantity: number
   date: string
+  /** Effective footprint, so the schedule page can offer Pallet View too. */
+  casesPerPallet: number | null
 }
 
 // A straight read of the uploaded production schedule, in the order the plant
@@ -437,7 +505,10 @@ export async function listProductionSchedule(): Promise<ProductionScheduleLine[]
   const [report] = await db.select().from(reports).where(eq(reports.type, 'production'))
   if (!report) return []
 
-  const lines = await db.select().from(reportLines).where(eq(reportLines.reportId, report.id))
+  const [lines, footprints] = await Promise.all([
+    db.select().from(reportLines).where(eq(reportLines.reportId, report.id)),
+    resolveFootprints(),
+  ])
 
   return lines
     .map((line) => ({
@@ -445,6 +516,7 @@ export async function listProductionSchedule(): Promise<ProductionScheduleLine[]
       materialName: line.materialName,
       quantity: line.quantity,
       date: line.productionDate ?? '',
+      casesPerPallet: footprints[line.material] ?? null,
     }))
     .sort((a, b) => {
       const ka = dateSortKey(a.date)
@@ -457,4 +529,117 @@ export async function listProductionSchedule(): Promise<ProductionScheduleLine[]
       }
       return compareMaterialNumber(a.material, b.material)
     })
+}
+
+/** Everything the dashboard's view controls decide, so an export is exactly the view. */
+export type VarianceExportRequest = {
+  view: ExportView
+  palletView: boolean
+  query: string
+  shortfallsOnly: boolean
+  from: string
+  to: string
+  condition: ShippingCondition
+  materialSort: SortState<MaterialSortKey>
+  loadSort: SortState<LoadSortKey>
+  /** Formatted on the client, so the report is stamped in the reader's own time zone. */
+  generatedAt: string
+  dateStamp: string
+}
+
+// Excel column widths are the one thing the shared document can't carry, since
+// it has no idea how wide a character is. Size each column to its widest cell.
+function columnWidths(rows: readonly (string | number)[][]) {
+  const widths: number[] = []
+  for (const row of rows) {
+    row.forEach((cell, i) => {
+      const length = String(cell ?? '').length
+      if (length > (widths[i] ?? 0)) widths[i] = length
+    })
+  }
+  return widths.map((w) => ({ wch: Math.min(Math.max(w + 2, 10), 48) }))
+}
+
+// Excel rejects : \ / ? * [ ] in a sheet name and truncates past 31 characters.
+function sheetName(name: string) {
+  return name.replace(/[:\\/?*[\]]/g, ' ').slice(0, 31)
+}
+
+export function buildWorkbookBase64(doc: ExportDocument): string {
+  const workbook = XLSX.utils.book_new()
+
+  // The filter context gets a sheet of its own rather than a banner above each
+  // table, so every data sheet starts at row 1 and sorts and filters in Excel
+  // without anyone having to delete a header block first.
+  const info: (string | number)[][] = [[doc.title], [], ...doc.meta.map(([k, v]) => [k, v])]
+  const infoSheet = XLSX.utils.aoa_to_sheet(info)
+  infoSheet['!cols'] = columnWidths(info)
+  XLSX.utils.book_append_sheet(workbook, infoSheet, 'Report info')
+
+  for (const table of doc.tables) {
+    const aoa: (string | number)[][] = [table.columns, ...table.rows]
+    const sheet = XLSX.utils.aoa_to_sheet(aoa)
+    sheet['!cols'] = columnWidths(aoa)
+    XLSX.utils.book_append_sheet(workbook, sheet, sheetName(table.name))
+  }
+
+  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' })
+  return Buffer.from(buffer).toString('base64')
+}
+
+/**
+ * The variance report as a workbook. It recomputes from the same pure helpers
+ * the dashboard uses — the same filter, the same sort, the same allocation —
+ * rather than trusting rows sent up from the browser, so the export can't drift
+ * from the report and a stale tab can't write nonsense into a file.
+ */
+export async function buildVarianceExport(request: VarianceExportRequest) {
+  const [reportsWithLines, footprints] = await Promise.all([
+    getAllReports(),
+    resolveFootprints(),
+  ])
+
+  const summary = computeMaterialSummary(reportsWithLines, footprints)
+  const materials = filterMaterialsByDelivery(summary, {
+    from: request.from,
+    to: request.to,
+    condition: request.condition,
+  })
+
+  const context = {
+    view: request.view,
+    palletView: request.palletView,
+    query: request.query,
+    shortfallsOnly: request.shortfallsOnly,
+    from: request.from,
+    to: request.to,
+    condition: request.condition,
+    sources: reportsWithLines.map((r) => r.label),
+    generatedAt: request.generatedAt,
+    dateStamp: request.dateStamp,
+  }
+
+  let doc: ExportDocument
+  if (request.view === 'load') {
+    const loads = summarizeLoads(materials)
+    const visible = filterAndSortLoads(loads, {
+      query: request.query,
+      shortfallsOnly: request.shortfallsOnly,
+      sort: request.loadSort,
+    })
+    doc = buildLoadExport(visible, { ...context, shown: visible.length, total: loads.length })
+  } else {
+    const visible = filterAndSortMaterials(materials, {
+      query: request.query,
+      shortfallsOnly: request.shortfallsOnly,
+      sort: request.materialSort,
+    })
+    doc = buildMaterialExport(visible, {
+      ...context,
+      shown: visible.length,
+      total: materials.length,
+    })
+  }
+
+  return { fileName: `${doc.fileName}.xlsx`, base64: buildWorkbookBase64(doc) }
 }
