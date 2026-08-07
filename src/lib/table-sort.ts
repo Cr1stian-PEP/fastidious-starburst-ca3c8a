@@ -54,6 +54,8 @@ export type LoadSortRow = {
   orderNumber: string
   customerPO: string
   shipDate: string
+  shipFrom?: string
+  shipTo?: string
   requested: number
   totalOnHand: number
   variance: number
@@ -151,6 +153,8 @@ export function filterAndSortLoads<T extends LoadSortRow>(
       (l) =>
         l.orderNumber.toLowerCase().includes(q) ||
         l.customerPO.toLowerCase().includes(q) ||
+        (l.shipFrom ?? '').toLowerCase().includes(q) ||
+        (l.shipTo ?? '').toLowerCase().includes(q) ||
         l.lines.some(
           (line) =>
             line.material.toLowerCase().includes(q) ||

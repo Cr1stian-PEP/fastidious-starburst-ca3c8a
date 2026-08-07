@@ -838,7 +838,7 @@ function Home() {
                       value={query}
                       onChange={(e) => setQuery(e.target.value)}
                       placeholder={
-                        loadView ? 'Find load, PO, or material' : 'Find material or name'
+                        loadView ? 'Find load, PO, plant, or material' : 'Find material or name'
                       }
                       className="text-sm border border-gray-200 rounded-lg pl-9 pr-3 py-2 w-56 focus:outline-none focus:ring-2 focus:ring-gray-900/10"
                     />
@@ -990,6 +990,28 @@ function Home() {
                             {isOpen && (
                               <tr className="bg-gray-50/60">
                                 <td colSpan={8} className="px-4 py-4">
+                                  {/* Where the load comes from and where it is
+                                      going — one pair for the whole load, so it
+                                      sits above the per-material table rather
+                                      than repeating down every row. */}
+                                  <dl className="flex flex-wrap gap-x-10 gap-y-2 mb-4">
+                                    <div>
+                                      <dt className="text-[11px] uppercase tracking-wide text-gray-400">
+                                        Ship From
+                                      </dt>
+                                      <dd className="text-xs text-gray-700">
+                                        {load.shipFrom || '—'}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="text-[11px] uppercase tracking-wide text-gray-400">
+                                        Ship To
+                                      </dt>
+                                      <dd className="text-xs text-gray-700">
+                                        {load.shipTo || '—'}
+                                      </dd>
+                                    </div>
+                                  </dl>
                                   <table className="w-full text-xs">
                                     <thead>
                                       <tr className="text-left text-gray-400 border-b border-gray-200">
