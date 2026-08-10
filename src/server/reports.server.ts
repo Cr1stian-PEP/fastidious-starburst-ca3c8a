@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm'
+import { and, eq, inArray, type SQL } from 'drizzle-orm'
 import * as XLSX from 'xlsx'
 import { db } from '../../db/index.js'
 import { reports, reportLines, materialFootprints } from '../../db/schema.js'
@@ -217,14 +217,44 @@ export function parseReportFile(fileBuffer: Buffer, type: ReportType): ParsedLin
   return result
 }
 
-export async function saveReport(type: ReportType, label: string, lines: ParsedLine[]) {
-  const existing = await db.select().from(reports).where(eq(reports.type, type))
-  for (const report of existing) {
-    await db.delete(reportLines).where(eq(reportLines.reportId, report.id))
-    await db.delete(reports).where(eq(reports.id, report.id))
-  }
+/**
+ * Deletes the reports matching `where` and their lines. The one place report
+ * rows are removed, so the lines always go with them — used by an upload
+ * replacing a slot, by Clear, and by the session purge.
+ */
+export async function deleteReportsWhere(where: SQL | undefined): Promise<number> {
+  // Drizzle types a composed condition as possibly undefined, which as a `where`
+  // would quietly mean every report in the database — including other people's.
+  if (!where) throw new Error('deleteReportsWhere requires a condition')
 
-  const [report] = await db.insert(reports).values({ type, label }).returning()
+  const existing = await db.select({ id: reports.id }).from(reports).where(where)
+  if (existing.length === 0) return 0
+
+  const ids = existing.map((report) => report.id)
+  await db.delete(reportLines).where(inArray(reportLines.reportId, ids))
+  await db.delete(reports).where(inArray(reports.id, ids))
+  return existing.length
+}
+
+/** Every report a session owns, of one type or of all three. */
+function ownedBy(sessionId: string, type?: ReportType) {
+  return type
+    ? and(eq(reports.sessionId, sessionId), eq(reports.type, type))
+    : eq(reports.sessionId, sessionId)
+}
+
+export async function saveReport(
+  sessionId: string,
+  type: ReportType,
+  label: string,
+  lines: ParsedLine[],
+) {
+  // An upload replaces whatever this session had in the slot — and only this
+  // session's, so a second person uploading their own production export doesn't
+  // pull the report out from under the first.
+  await deleteReportsWhere(ownedBy(sessionId, type))
+
+  const [report] = await db.insert(reports).values({ sessionId, type, label }).returning()
 
   if (lines.length > 0) {
     await db.insert(reportLines).values(
@@ -248,9 +278,14 @@ export async function saveReport(type: ReportType, label: string, lines: ParsedL
   return report
 }
 
-export async function getAllReports() {
-  const allReports = await db.select().from(reports)
-  const allLines = await db.select().from(reportLines)
+export async function getAllReports(sessionId: string) {
+  const allReports = await db.select().from(reports).where(ownedBy(sessionId))
+  if (allReports.length === 0) return []
+
+  const allLines = await db
+    .select()
+    .from(reportLines)
+    .where(inArray(reportLines.reportId, allReports.map((report) => report.id)))
 
   return allReports.map((report) => ({
     ...report,
@@ -280,13 +315,8 @@ export function deliveryNeedsReupload(stored: readonly StoredReport[]) {
   })
 }
 
-export async function clearReport(type: ReportType) {
-  const existing = await db.select().from(reports).where(eq(reports.type, type))
-  for (const report of existing) {
-    await db.delete(reportLines).where(eq(reportLines.reportId, report.id))
-    await db.delete(reports).where(eq(reports.id, report.id))
-  }
-  return { cleared: existing.length }
+export async function clearReport(sessionId: string, type: ReportType) {
+  return { cleared: await deleteReportsWhere(ownedBy(sessionId, type)) }
 }
 
 export const BASELINE_FOOTPRINTS = footprintKey as Record<string, number>
@@ -311,12 +341,17 @@ export async function resolveFootprints(): Promise<Record<string, number>> {
 }
 
 // Every material the app knows about: from the footprint key, from user
-// overrides, and from the uploaded reports (so a material with no footprint yet
-// still shows up and can be given one).
-export async function listFootprints(): Promise<FootprintRow[]> {
+// overrides, and from this session's uploaded reports (so a material with no
+// footprint yet still shows up and can be given one). The key and the overrides
+// are shared reference data; only the uploads are session-scoped.
+export async function listFootprints(sessionId: string): Promise<FootprintRow[]> {
   const [overrides, lines] = await Promise.all([
     db.select().from(materialFootprints),
-    db.selectDistinct({ material: reportLines.material, materialName: reportLines.materialName }).from(reportLines),
+    db
+      .selectDistinct({ material: reportLines.material, materialName: reportLines.materialName })
+      .from(reportLines)
+      .innerJoin(reports, eq(reportLines.reportId, reports.id))
+      .where(ownedBy(sessionId)),
   ])
 
   const overrideMap = new Map(overrides.map((o) => [o.material, o.casesPerPallet]))
@@ -501,8 +536,8 @@ export type ProductionScheduleLine = {
 
 // A straight read of the uploaded production schedule, in the order the plant
 // works it: earliest date first, materials in number order within a date.
-export async function listProductionSchedule(): Promise<ProductionScheduleLine[]> {
-  const [report] = await db.select().from(reports).where(eq(reports.type, 'production'))
+export async function listProductionSchedule(sessionId: string): Promise<ProductionScheduleLine[]> {
+  const [report] = await db.select().from(reports).where(ownedBy(sessionId, 'production'))
   if (!report) return []
 
   const [lines, footprints] = await Promise.all([
@@ -597,9 +632,9 @@ export function buildWorkbookBase64(doc: ExportDocument): string {
  * rather than trusting rows sent up from the browser, so the export can't drift
  * from the report and a stale tab can't write nonsense into a file.
  */
-export async function buildVarianceExport(request: VarianceExportRequest) {
+export async function buildVarianceExport(sessionId: string, request: VarianceExportRequest) {
   const [reportsWithLines, footprints] = await Promise.all([
-    getAllReports(),
+    getAllReports(sessionId),
     resolveFootprints(),
   ])
 

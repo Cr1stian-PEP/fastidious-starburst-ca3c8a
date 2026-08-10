@@ -24,7 +24,7 @@ A material stock variance report. Users upload three spreadsheet exports — **p
 
 ```
 ├── db
-│   ├── schema.ts       # Drizzle table definitions: reports, report_lines, material_footprints
+│   ├── schema.ts       # Drizzle table definitions: report_sessions, reports, report_lines, material_footprints
 │   └── index.ts        # Drizzle client (Netlify Database adapter)
 ├── netlify/database/migrations   # Auto-generated SQL migrations, applied by Netlify at deploy time
 ├── scripts
@@ -33,6 +33,7 @@ A material stock variance report. Users upload three spreadsheet exports — **p
 ├── src
 │   ├── server
 │   │   ├── reports.server.ts     # Spreadsheet parsing, DB reads/writes, variance calc (server-only)
+│   │   ├── session.server.ts     # Per-visit session cookie, scoping, and purge of stale uploads
 │   │   ├── reports.functions.ts  # createServerFn wrappers exposed to the client
 │   │   └── data/material-footprints.json  # material number -> cases per pallet
 │   ├── components
@@ -58,18 +59,34 @@ A material stock variance report. Users upload three spreadsheet exports — **p
 
 ## Data Model
 
-Each report occupies one of three typed slots — `production`, `materials`, or `delivery`. Uploading a new file into a slot replaces whatever was previously there (report row + its line items), so the report is always computed across the current three uploads. Each tile also has a **Clear** button, which deletes that slot's report row and lines and leaves the other two in place. The `delivery` slot is labelled **Outbound loads** in the UI; the `ReportType` key, the server fns, and the database all still say `delivery`.
+Each report occupies one of three typed slots — `production`, `materials`, or `delivery` — **within one browser session** (see *Sessions* below). Uploading a new file into a slot replaces whatever that session previously had there (report row + its line items), so the report is always computed across the session's current three uploads. Each tile also has a **Clear** button, which deletes that slot's report row and lines and leaves the other two in place; the header's **Clear all** drops all three at once. The `delivery` slot is labelled **Outbound loads** in the UI; the `ReportType` key, the server fns, and the database all still say `delivery`.
 
-- `reports`: `id`, `type`, `label` (the uploaded file name, extension included, so the tile can show it), `raw_sheet`, `created_at`
+- `report_sessions`: `id` (a `randomUUID`, PK), `created_at`, `last_seen_at` — one browser visit
+- `reports`: `id`, `type`, `label` (the uploaded file name, extension included, so the tile can show it), `session_id`, `raw_sheet`, `created_at`
 - `report_lines`: `id`, `report_id`, `material`, `material_name`, `quantity`, plus delivery-only detail
   columns `order_number`, `customer_po`, `plant_name`, `sold_to`, `loading_date`, `ship_date`,
   `shipping_condition`, and the production-only `production_date`
 - `material_footprints`: `material` (PK), `cases_per_pallet`, `updated_at` — user edits that override the
-  generated footprint key
+  generated footprint key. **Shared, not per session**: it is a correction to the pallet key, reference data
+  rather than someone's uploaded report, and scoping it would throw away every correction on each visit.
 
 `raw_sheet` is a leftover column. It once held the uploaded workbook as a JSON `string[][]` grid for a raw-grid production page that has since been reverted; nothing writes or reads it now. It stays in `db/schema.ts` only because its migration is applied and applied migrations are never edited.
 
 Detail columns are only written at upload time, so a schema addition doesn't backfill: the affected export has to be re-uploaded before its new column holds anything. That applies to `shipping_condition` too — the outbound loads export has to be re-uploaded before the `01` option shows real data.
+
+## Sessions
+
+Several people use this report at the same time, each on their own three exports, and those exports hold internal production and customer data. So **an upload belongs to the browser visit that made it and is only ever read back through it**. `src/server/session.server.ts` owns that:
+
+- `ensureSession()` reads the `mvr_session` cookie, and every server function that touches uploaded data calls it first — nothing reads or writes a report unscoped. It returns the session id; `reports.server.ts` takes that id as its first argument (`getAllReports`, `saveReport`, `clearReport`, `listFootprints`, `listProductionSchedule`, `buildVarianceExport`) and filters on `reports.session_id` through the private `ownedBy` helper.
+- The cookie is `httpOnly`, `sameSite=lax`, `secure` over https, and carries **no** `Max-Age`, so the browser drops it when the browser session ends.
+- A session is also expired server-side once `last_seen_at` is more than `SESSION_IDLE_MS` (30 minutes) old, because a shared workstation is often never closed: the next request deletes that session's uploads and hands out a new, empty one. Every request through `ensureSession` refreshes `last_seen_at`, so the window is measured from the last request rather than from the first.
+- Creating a session first runs `purgeUnreachableReports()`: idle sessions go, and so do reports with a null `session_id` — rows from before scoping existed, which no session can reach but which shouldn't sit in the database either. It runs on session creation rather than per request, since a new visit is exactly when the report is meant to come up clean.
+- `resetCurrentSession()` backs **Clear all**: it deletes the session and its reports and starts a fresh one. The dashboard also puts the search box, both filter buttons, the ship-date range and the site back to their defaults, so nothing of the cleared report is left on the page.
+- `deleteReportsWhere` in `reports.server.ts` is the single place report rows are deleted, so lines always go with them. It **throws** on an undefined condition — Drizzle types a composed `and(...)` as possibly undefined, and an undefined `where` would silently mean every report in the database.
+- Responses that carry report data are sent `Cache-Control: no-store`, so a shared browser's history or an intermediary can't hand one person's report to the next.
+
+A refresh, a navigation to `/production` or `/footprints`, and an upload all keep the same session — losing three uploads to a stray reload would make the page unusable. What a new visit never inherits is another session's data.
 
 ## Input Formats
 
@@ -254,5 +271,7 @@ npm run build    # Production build
 ## Conventions
 
 - Server-only logic lives in `*.server.ts` files and is never imported from client components.
+- Anything that reads or writes an uploaded report takes a session id and filters on it — see *Sessions*. A new
+  query over `reports` or `report_lines` that doesn't is a cross-user data leak, not just a bug.
 - Client-callable RPCs live in `*.functions.ts` files using `createServerFn` with `.inputValidator` (zod) for anything that takes input. Uploads are sent as base64 so binary `.xlsx` files survive the round trip.
 - Schema changes go through `db/schema.ts` + `npx drizzle-kit generate --name <slug>` — never hand-written DDL.

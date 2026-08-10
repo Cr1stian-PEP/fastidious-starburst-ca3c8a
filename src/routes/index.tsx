@@ -29,8 +29,10 @@ import {
   Boxes,
   FileSpreadsheet,
   Printer,
+  ShieldCheck,
 } from 'lucide-react'
 import {
+  clearAllReports,
   exportVarianceWorkbook,
   getVarianceData,
   removeReport,
@@ -185,6 +187,7 @@ function Home() {
   const router = useRouter()
   const data = Route.useLoaderData()
   const [pending, setPending] = useState<ReportType | null>(null)
+  const [clearingAll, setClearingAll] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [palletView, setPalletView] = useState(false)
@@ -263,6 +266,38 @@ function Home() {
       setError(e instanceof Error ? e.message : 'Failed to clear report')
     } finally {
       setPending(null)
+    }
+  }
+
+  // Ends this browser session's uploads in one go, so someone handing the
+  // machine on doesn't have to clear three slots one at a time. The view
+  // controls go back to their defaults with them — nothing of the last report
+  // is left on the page.
+  async function handleClearAll() {
+    if (
+      !window.confirm(
+        'Clear all three uploads? This removes the files from this session and cannot be undone.',
+      )
+    )
+      return
+
+    setClearingAll(true)
+    setError(null)
+    try {
+      await clearAllReports()
+      setExpanded(null)
+      setExpandedLoad(null)
+      setQuery('')
+      setShortfallsOnly(false)
+      setDeliveriesOnly(false)
+      setShipFrom('')
+      setShipTo('')
+      setSite('')
+      await router.invalidate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to clear uploads')
+    } finally {
+      setClearingAll(false)
     }
   }
 
@@ -744,6 +779,18 @@ function Home() {
               Pallet footprints
               <ArrowRight className="w-4 h-4 text-gray-400" />
             </Link>
+            {data.reports.length > 0 && (
+              <button
+                type="button"
+                onClick={handleClearAll}
+                disabled={clearingAll || pending !== null}
+                title="Remove all three uploads from this session"
+                className="inline-flex items-center gap-2 text-sm font-medium rounded-lg px-4 py-2 bg-white text-gray-700 shadow-sm hover:bg-red-50 hover:text-red-700 disabled:opacity-50 transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+                {clearingAll ? 'Clearing…' : 'Clear all'}
+              </button>
+            )}
           </div>
         </div>
 
@@ -817,6 +864,21 @@ function Home() {
             )
           })}
         </div>
+
+        {/* Uploads are held against this browser session only, so several people
+            can work on their own three exports at once and nobody inherits the
+            files the last person left behind. Worth saying on the page, since
+            it also explains why the slots come up empty on a new visit. */}
+        <p className="-mt-4 mb-8 flex items-start gap-2 text-xs text-gray-400">
+          <ShieldCheck className="w-4 h-4 shrink-0 text-gray-300" />
+          <span>
+            These uploads are visible only in this browser session. They are
+            cleared when you close the browser, after{' '}
+            {formatNumber(data.sessionIdleMinutes)} minutes without activity, or
+            as soon as you choose Clear all — so a new visit always starts from
+            empty slots.
+          </span>
+        </p>
 
         {error && (
           <div className="mb-8 flex items-center gap-2 bg-red-50 text-red-700 border border-red-200 rounded-lg px-4 py-3 text-sm">

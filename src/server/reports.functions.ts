@@ -16,12 +16,22 @@ import {
   REPORT_TYPES,
   type ReportType,
 } from './reports.server.js'
+import {
+  SESSION_IDLE_MINUTES,
+  ensureSession,
+  resetCurrentSession,
+} from './session.server.js'
 
 const reportTypeSchema = z.enum(REPORT_TYPES as [ReportType, ...ReportType[]])
 
+// Uploaded reports belong to the browser visit that made them: every function
+// below resolves that session first and reads or writes nothing outside it, so
+// simultaneous users never see each other's files and a fresh visit starts with
+// empty slots. See session.server.ts.
 export const getVarianceData = createServerFn({ method: 'GET' }).handler(async () => {
+  const sessionId = await ensureSession()
   const [reportsWithLines, footprints] = await Promise.all([
-    getAllReports(),
+    getAllReports(sessionId),
     resolveFootprints(),
   ])
   const materials = computeMaterialSummary(reportsWithLines, footprints)
@@ -37,6 +47,8 @@ export const getVarianceData = createServerFn({ method: 'GET' }).handler(async (
     // before the K/L mapping still shows the old column-P numbers until it is
     // uploaded again. The dashboard says so rather than showing them quietly.
     deliveryNeedsReupload: deliveryNeedsReupload(reportsWithLines),
+    // So the page can say how long an unattended report survives.
+    sessionIdleMinutes: SESSION_IDLE_MINUTES,
   }
 })
 
@@ -50,22 +62,30 @@ export const uploadReport = createServerFn({ method: 'POST' })
     }),
   )
   .handler(async ({ data }) => {
+    const sessionId = await ensureSession()
     const buffer = Buffer.from(data.fileBase64, 'base64')
     const lines = parseReportFile(buffer, data.type)
-    const report = await saveReport(data.type, data.label, lines)
+    const report = await saveReport(sessionId, data.type, data.label, lines)
     return { id: report.id, lineCount: lines.length }
   })
 
 export const removeReport = createServerFn({ method: 'POST' })
   .inputValidator(z.object({ type: reportTypeSchema }))
-  .handler(async ({ data }) => clearReport(data.type))
+  .handler(async ({ data }) => clearReport(await ensureSession(), data.type))
+
+// Drops all three uploads at once by ending the session that owns them and
+// handing back a new empty one.
+export const clearAllReports = createServerFn({ method: 'POST' }).handler(async () => {
+  await resetCurrentSession()
+  return { cleared: true }
+})
 
 export const getFootprints = createServerFn({ method: 'GET' }).handler(async () =>
-  listFootprints(),
+  listFootprints(await ensureSession()),
 )
 
 export const getProductionSchedule = createServerFn({ method: 'GET' }).handler(async () =>
-  listProductionSchedule(),
+  listProductionSchedule(await ensureSession()),
 )
 
 export const saveFootprint = createServerFn({ method: 'POST' })
@@ -132,4 +152,4 @@ export const exportVarianceWorkbook = createServerFn({ method: 'POST' })
       dateStamp: z.string().regex(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/),
     }),
   )
-  .handler(async ({ data }) => buildVarianceExport(data))
+  .handler(async ({ data }) => buildVarianceExport(await ensureSession(), data))
