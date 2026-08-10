@@ -102,10 +102,14 @@ export const exportVarianceWorkbook = createServerFn({ method: 'POST' })
       palletView: z.boolean(),
       query: z.string().max(200),
       shortfallsOnly: z.boolean(),
+      // By-material view only; the load view ignores it.
+      deliveriesOnly: z.boolean(),
       // Blank on either end is open-ended, matching the date inputs.
       from: z.string().max(10),
       to: z.string().max(10),
       condition: z.enum(['01', '02', 'both']),
+      // Blank is every site, matching the dropdown's first option.
+      site: z.string().max(200),
       materialSort: z.object({
         key: z.enum(['material', 'materialName', 'totalOnHand', 'requested', 'variance']),
         dir: sortDir,

@@ -22,7 +22,6 @@ import {
   Warehouse,
   Truck,
   Layers,
-  Search,
   Filter,
   Trash2,
   Ruler,
@@ -38,19 +37,32 @@ import {
   uploadReport,
 } from '../server/reports.functions'
 import { SortHeader } from '../components/sort-header'
+import { ReportSearch, type SearchSuggestion } from '../components/report-search'
+import { AllocationSummaryPanel } from '../components/allocation-summary'
 import {
+  collectDeliverySites,
   dateSortKey,
   filterAndSortLoads,
   filterAndSortMaterials,
   filterMaterialsByDelivery,
+  matchesQuery,
+  mergeSuggestions,
   sortDeliveries,
+  suggestLoads,
+  suggestMaterials,
   type DeliverySortKey,
   type LoadSortKey,
   type MaterialSortKey,
   type ShippingCondition,
   type SortState,
 } from '../lib/table-sort'
-import { summarizeLoads, topShortfallMaterials, deliveryLoadKey } from '../lib/shortfalls'
+import {
+  restrictLoadsToMaterials,
+  summarizeAllocation,
+  summarizeLoads,
+  topShortfallMaterials,
+  deliveryLoadKey,
+} from '../lib/shortfalls'
 import {
   formatNumber,
   formatCustomerPo,
@@ -180,12 +192,20 @@ function Home() {
   const [expandedLoad, setExpandedLoad] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [shortfallsOnly, setShortfallsOnly] = useState(false)
+  // By-material view only: hide materials no load is asking for, so the table is
+  // just the stock the outbound book actually touches.
+  const [deliveriesOnly, setDeliveriesOnly] = useState(false)
   // Ship-date window on the demand side. Blank on either end is open-ended.
   const [shipFrom, setShipFrom] = useState('')
   const [shipTo, setShipTo] = useState('')
   // Shipping condition on the demand side. '02' is what the report showed
   // before the selector existed, so it stays the default.
   const [condition, setCondition] = useState<ShippingCondition>('02')
+  // Ship-from site (plant, column W) on the demand side. Blank is every site.
+  const [site, setSite] = useState('')
+  // Share of its demand a load must be allocated to count as fully allocated.
+  // 100% means "covered or not", which is where the report starts.
+  const [allocationTarget, setAllocationTarget] = useState(100)
   const [chartOpen, setChartOpen] = useState(true)
   const [sort, setSort] = useState<SortState<MaterialSortKey>>({
     key: 'material',
@@ -246,15 +266,24 @@ function Home() {
     }
   }
 
-  // A ship-date window and the shipping condition narrow the demand side before
-  // anything is computed, so the tiles, the chart and both tables all read the
-  // same filtered figures.
+  // A ship-date window, the shipping condition and the site narrow the demand
+  // side before anything is computed, so the tiles, the chart and both tables
+  // all read the same filtered figures.
   const allMaterials = data.materials
   const rangeActive = Boolean(shipFrom || shipTo)
   const materials = useMemo(
-    () => filterMaterialsByDelivery(allMaterials, { from: shipFrom, to: shipTo, condition }),
-    [allMaterials, shipFrom, shipTo, condition],
+    () =>
+      filterMaterialsByDelivery(allMaterials, {
+        from: shipFrom,
+        to: shipTo,
+        condition,
+        site,
+      }),
+    [allMaterials, shipFrom, shipTo, condition, site],
   )
+  // Every site named in the outbound loads report, taken from the unfiltered
+  // uploads so picking one doesn't shrink the list to that one.
+  const sites = useMemo(() => collectDeliverySites(allMaterials), [allMaterials])
   // Undated delivery lines can't be shown to fall inside a window, so they are
   // dropped while one is active — worth saying out loud.
   const undatedDropped = useMemo(() => {
@@ -303,14 +332,152 @@ function Home() {
   )
 
   const visibleMaterials = useMemo(
-    () => filterAndSortMaterials(materials, { query, shortfallsOnly, sort }),
-    [materials, query, shortfallsOnly, sort],
+    () => filterAndSortMaterials(materials, { query, shortfallsOnly, deliveriesOnly, sort }),
+    [materials, query, shortfallsOnly, deliveriesOnly, sort],
   )
   const visibleLoads = useMemo(
     () => filterAndSortLoads(loads, { query, shortfallsOnly, sort: loadSort }),
     [loads, query, shortfallsOnly, loadSort],
   )
   const loadView = chartGroup === 'load'
+
+  // Which filters are narrowing the material table, and — when they leave it
+  // empty — which one to blame.
+  const materialFilterNote = [
+    shortfallsOnly && 'shortfalls only',
+    deliveriesOnly && 'with delivery lines',
+  ]
+    .filter(Boolean)
+    .join(', ')
+  const noMaterialsNote = shortfallsOnly
+    ? query.trim()
+      ? `No shortfalls match “${query}”.`
+      : 'No shortfalls — every material has enough stock on hand.'
+    : deliveriesOnly
+      ? query.trim()
+        ? `No materials with delivery lines match “${query}”.`
+        : 'No material in this view has delivery lines.'
+      : `No materials match “${query}”.`
+
+  // How the loads in this view came out of the allocation, for the read-out
+  // above the table. It follows the table rather than the whole book: in load
+  // mode it is the load rows on screen, and in material mode it is each load's
+  // share of the materials on screen — so searching one material answers the
+  // question for that material instead of for everything. The allocation itself
+  // is never re-run; this reads a slice of the pass the table renders.
+  const scopedLoads = useMemo(() => {
+    if (loadView) return visibleLoads
+    if (visibleMaterials.length === materials.length) return loads
+    return restrictLoadsToMaterials(
+      loads,
+      visibleMaterials.map((m) => m.material),
+    )
+  }, [loadView, visibleLoads, visibleMaterials, materials.length, loads])
+
+  const allocation = useMemo(
+    () => summarizeAllocation(scopedLoads, allocationTarget),
+    [scopedLoads, allocationTarget],
+  )
+  // Pallet figures are built material by material, so each of these is summed
+  // across the loads' own lines rather than divided at the end.
+  const scopedLines = useMemo(
+    () => scopedLoads.flatMap((load) => load.lines),
+    [scopedLoads],
+  )
+  const allocatedTotal = useMemo(
+    () => totalUnits(scopedLines, (line) => line.available),
+    [scopedLines],
+  )
+  const neededTotal = useMemo(
+    () => totalUnits(scopedLines, (line) => line.requested),
+    [scopedLines],
+  )
+  const shortTotal = useMemo(
+    () =>
+      totalUnits(
+        allocation.shortLoads.flatMap((load) => load.lines),
+        (line) => Math.max(0, -line.variance),
+      ),
+    [allocation],
+  )
+  // Exactly what those figures cover, said out loud — the panel moves with the
+  // search, so it has to name what it is counting.
+  const allocationScope = useMemo(() => {
+    const filtered = Boolean(query.trim()) || shortfallsOnly || (!loadView && deliveriesOnly)
+    if (!filtered) return 'Every load in the current view'
+    if (loadView) {
+      return `${formatNumber(visibleLoads.length)} of ${formatNumber(
+        loads.length,
+      )} loads on screen`
+    }
+    return `${formatNumber(visibleMaterials.length)} of ${formatNumber(
+      materials.length,
+    )} materials on screen, across ${formatNumber(allocation.loads)} load${
+      allocation.loads === 1 ? '' : 's'
+    }`
+  }, [
+    query,
+    shortfallsOnly,
+    deliveriesOnly,
+    loadView,
+    visibleLoads.length,
+    loads.length,
+    visibleMaterials.length,
+    materials.length,
+    allocation.loads,
+  ])
+
+  // Material and load numbers are long digit strings, so the search box offers
+  // what matches as they are typed. Both kinds are offered in either grouping —
+  // a material typed in the load view finds the loads carrying it, a load typed
+  // in the material view finds the materials on it — with the rows the current
+  // view renders leading the list. Suggestions come from the filtered set, so
+  // they can only point at rows this view actually holds.
+  const suggestions = useMemo<SearchSuggestion[]>(() => {
+    const materialHits: SearchSuggestion[] = suggestMaterials(materials, query).map(
+      (m) => ({
+        kind: 'material',
+        value: m.material,
+        label: m.material,
+        detail: m.materialName,
+        // A material that is short says so in the list, so the suggestion is
+        // worth picking before the row is even open.
+        note:
+          m.variance < 0
+            ? `short ${formatQty(Math.abs(m.variance), m.casesPerPallet, palletView)}`
+            : '',
+      }),
+    )
+    const loadHits: SearchSuggestion[] = suggestLoads(loads, query)
+      .map((load) => ({
+        kind: 'load' as const,
+        // A condition-01 pickup has no load number, so its PO is the only thing
+        // a search can find it by.
+        value: load.orderNumber.trim() || load.customerPO.trim(),
+        label: loadLabel(load),
+        detail: [load.shipTo, load.shipDate].filter(Boolean).join(' · '),
+        note:
+          load.variance < 0
+            ? `short ${formatTotal(
+                totalUnits(load.lines, (line) => Math.max(0, -line.variance)),
+                palletView,
+              )}`
+            : '',
+      }))
+      // A load matched on its plant alone may carry neither number; there is
+      // nothing to put in the search box for it.
+      .filter((suggestion) => suggestion.value)
+
+    return mergeSuggestions(
+      loadView ? loadHits : materialHits,
+      loadView ? materialHits : loadHits,
+    )
+  }, [materials, loads, query, loadView, palletView])
+
+  // The search reaches across the grouping, so a query can match rows the other
+  // view is the one that shows. Counting them is free — both tables are filtered
+  // on every render — and it turns a dead end into one click.
+  const crossViewMatches = loadView ? visibleMaterials.length : visibleLoads.length
 
   // What the export has to record besides the rows: which filters produced
   // them, in which units, and from which uploads. Timestamps come from here so
@@ -322,9 +489,11 @@ function Home() {
       palletView,
       query,
       shortfallsOnly,
+      deliveriesOnly,
       from: shipFrom,
       to: shipTo,
       condition,
+      site,
       sources: data.reports.map((r) => r.label),
       generatedAt: now.toLocaleString(),
       dateStamp: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
@@ -357,9 +526,11 @@ function Home() {
           palletView,
           query,
           shortfallsOnly,
+          deliveriesOnly,
           from: shipFrom,
           to: shipTo,
           condition,
+          site,
           materialSort: sort,
           loadSort,
           generatedAt: ctx.generatedAt,
@@ -418,12 +589,13 @@ function Home() {
 
   function revealMaterial(target: RevealTarget) {
     if (!target.material) return
-    // A search or the shortfalls filter could be hiding the row we are about to
-    // scroll to, so relax whichever one would exclude it.
+    // A search or either filter could be hiding the row we are about to scroll
+    // to, so relax whichever one would exclude it.
     if (!visibleMaterials.some((m) => m.material === target.material)) {
       setQuery('')
       const row = materials.find((m) => m.material === target.material)
       if (shortfallsOnly && row && row.variance >= 0) setShortfallsOnly(false)
+      if (deliveriesOnly && row && row.deliveries.length === 0) setDeliveriesOnly(false)
     }
     setExpanded(target.material)
     setPendingReveal(target)
@@ -454,6 +626,24 @@ function Home() {
     setPendingReveal(null)
   }
 
+  // Both tables answer the same query, so when the other one has rows for it,
+  // say so and offer the switch — the search keeps its text across the toggle.
+  const crossViewHint =
+    query.trim() && crossViewMatches > 0 ? (
+      <p className="text-xs text-gray-500 mt-2">
+        {formatNumber(crossViewMatches)}{' '}
+        {loadView ? 'material' : 'load'}
+        {crossViewMatches === 1 ? '' : 's'} also match “{query.trim()}”.{' '}
+        <button
+          type="button"
+          onClick={() => selectChartGroup(loadView ? 'material' : 'load')}
+          className="font-medium text-gray-900 underline decoration-dotted hover:no-underline"
+        >
+          {loadView ? 'View by material #' : 'View by load #'}
+        </button>
+      </p>
+    ) : null
+
   useEffect(() => {
     if (!pendingReveal) return
     const row = loadView
@@ -473,6 +663,12 @@ function Home() {
     const timer = setTimeout(() => setHighlight(null), 4000)
     return () => clearTimeout(timer)
   }, [highlight])
+
+  // A re-upload can retire a site. Fall back to every site rather than leaving
+  // the report filtered to a plant that is no longer in the data.
+  useEffect(() => {
+    if (site && !sites.includes(site)) setSite('')
+  }, [site, sites])
 
   const chartData = {
     labels: chartRows.map((r) => r.label),
@@ -807,6 +1003,35 @@ function Home() {
                         })}
                       </div>
                     </div>
+                    {/* Ship-from site (column W). A demand-side filter like the
+                        two above it, so it narrows the tiles, the chart and both
+                        tables together. */}
+                    <div>
+                      <label
+                        htmlFor="ship-site"
+                        className="block text-xs font-medium text-gray-500 mb-1"
+                      >
+                        Site
+                      </label>
+                      <select
+                        id="ship-site"
+                        value={site}
+                        onChange={(e) => setSite(e.target.value)}
+                        disabled={sites.length === 0}
+                        className="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white max-w-[14rem] focus:outline-none focus:ring-2 focus:ring-gray-900/10 disabled:text-gray-400"
+                      >
+                        <option value="">
+                          {sites.length === 0
+                            ? 'No sites in the report'
+                            : `All sites (${sites.length})`}
+                        </option>
+                        {sites.map((name) => (
+                          <option key={name} value={name}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                     <button
                       type="button"
                       onClick={() => setChartOpen((v) => !v)}
@@ -909,24 +1134,70 @@ function Home() {
             </div>
 
             {/* Table */}
-            <div className="bg-white rounded-xl shadow-sm p-6 overflow-x-auto">
+            {/* Horizontal scrolling belongs to the tables, not to the card: the
+                search box's suggestion list hangs out of the header, and an
+                overflow on the card would clip it. */}
+            <div className="bg-white rounded-xl shadow-sm p-6">
+              {/* What the loads on screen add up to, above the rows that break
+                  it down. Nothing to allocate without an outbound loads report,
+                  so it waits for one rather than showing a row of zeros. */}
+              {reportsByType.has('delivery') && (
+                <AllocationSummaryPanel
+                  availableText={formatTotal(allocatedTotal, palletView)}
+                  availableNote={unkeyedNote(allocatedTotal, palletView)}
+                  neededText={formatTotal(neededTotal, palletView)}
+                  neededNote={unkeyedNote(neededTotal, palletView)}
+                  allocatedPercent={allocation.allocatedPercent}
+                  loads={allocation.loads}
+                  allocated={allocation.allocated}
+                  withinTolerance={allocation.withinTolerance}
+                  short={allocation.short}
+                  shortText={formatTotal(shortTotal, palletView)}
+                  threshold={allocationTarget}
+                  onThresholdChange={setAllocationTarget}
+                  query={query}
+                  shortfallsOnly={shortfallsOnly}
+                  deliveriesOnly={!loadView && deliveriesOnly}
+                  scopeNote={allocationScope}
+                />
+              )}
               <div className="flex items-center justify-between gap-4 mb-4 flex-wrap">
                 <h2 className="text-lg font-semibold text-gray-900">
                   {loadView ? 'Variance by load' : 'Variance by material'}
                 </h2>
                 <div className="flex items-center gap-3 flex-wrap">
-                  <div className="relative">
-                    <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="search"
-                      value={query}
-                      onChange={(e) => setQuery(e.target.value)}
-                      placeholder={
-                        loadView ? 'Find load, PO, plant, or material' : 'Find material or name'
-                      }
-                      className="text-sm border border-gray-200 rounded-lg pl-9 pr-3 py-2 w-56 focus:outline-none focus:ring-2 focus:ring-gray-900/10"
-                    />
-                  </div>
+                  <ReportSearch
+                    id="variance-search"
+                    value={query}
+                    onChange={setQuery}
+                    suggestions={suggestions}
+                    placeholder={
+                      loadView
+                        ? 'Find load, PO, plant, or material'
+                        : 'Find material, load, PO, or plant'
+                    }
+                  />
+                  {/* A load exists because of its delivery lines, so every load
+                      row has them — the filter only means something against the
+                      material table. */}
+                  {!loadView && (
+                    <button
+                      type="button"
+                      onClick={() => setDeliveriesOnly((v) => !v)}
+                      aria-pressed={deliveriesOnly}
+                      title="Hide materials no outbound load is asking for"
+                      className={`inline-flex items-center gap-2 text-sm font-medium rounded-lg px-4 py-2 transition-colors ${
+                        deliveriesOnly
+                          ? 'bg-amber-500 text-white'
+                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                    >
+                      <Truck className="w-4 h-4" />
+                      {deliveriesOnly
+                        ? 'With delivery lines: On'
+                        : 'With Delivery Lines'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setShortfallsOnly((v) => !v)}
@@ -974,6 +1245,7 @@ function Home() {
               )}
               {loadView && (
                 <>
+                  <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="text-left text-gray-500 border-b border-gray-100">
@@ -1131,10 +1403,23 @@ function Home() {
                                       </tr>
                                     </thead>
                                     <tbody>
-                                      {load.lines.map((line) => (
+                                      {load.lines.map((line) => {
+                                        // In this view the search is often a
+                                        // material number — the line it matched
+                                        // is the reason the load is on screen,
+                                        // so it is pointed at rather than left
+                                        // to be found by eye.
+                                        const isSearchMatch = matchesQuery(
+                                          query,
+                                          line.material,
+                                          line.materialName,
+                                        )
+                                        return (
                                         <tr
                                           key={line.material}
-                                          className="border-b border-gray-100 last:border-0"
+                                          className={`border-b border-gray-100 last:border-0 ${
+                                            isSearchMatch ? 'bg-blue-50' : ''
+                                          }`}
                                         >
                                           <td className="py-1 pr-4 font-mono text-gray-700">
                                             {line.material}
@@ -1170,7 +1455,8 @@ function Home() {
                                             )}
                                           </td>
                                         </tr>
-                                      ))}
+                                        )
+                                      })}
                                     </tbody>
                                   </table>
                                 </td>
@@ -1181,6 +1467,7 @@ function Home() {
                       })}
                     </tbody>
                   </table>
+                  </div>
                   {visibleLoads.length === 0 && (
                     <p className="text-sm text-gray-400 py-8 text-center">
                       {!shortfallsOnly
@@ -1195,10 +1482,12 @@ function Home() {
                     {formatNumber(loads.length)} loads
                     {shortfallsOnly && ' (shortfalls only)'}
                   </p>
+                  {crossViewHint}
                 </>
               )}
               {!loadView && (
                 <>
+              <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-left text-gray-500 border-b border-gray-100">
@@ -1437,13 +1726,27 @@ function Home() {
                                         isHighlighted &&
                                         !!highlight?.load &&
                                         deliveryLoadKey(d) === highlight.load
+                                      // The search may be pointing at a load
+                                      // rather than at this material, in which
+                                      // case this is the line that kept the row.
+                                      const isSearchMatch =
+                                        !isTargetLine &&
+                                        matchesQuery(
+                                          query,
+                                          d.orderNumber,
+                                          d.customerPO,
+                                          d.plantName,
+                                          d.soldTo,
+                                        )
                                       return (
                                         <tr
                                           key={i}
                                           className={`border-b border-gray-100 last:border-0 ${
                                             isTargetLine
                                               ? 'bg-amber-100/80 font-medium'
-                                              : ''
+                                              : isSearchMatch
+                                                ? 'bg-blue-50'
+                                                : ''
                                           }`}
                                         >
                                           <td className="py-1 pr-4 text-gray-700">
@@ -1478,20 +1781,18 @@ function Home() {
                   })}
                 </tbody>
               </table>
+              </div>
               {visibleMaterials.length === 0 && (
                 <p className="text-sm text-gray-400 py-8 text-center">
-                  {!shortfallsOnly
-                    ? `No materials match “${query}”.`
-                    : query.trim()
-                      ? `No shortfalls match “${query}”.`
-                      : 'No shortfalls — every material has enough stock on hand.'}
+                  {noMaterialsNote}
                 </p>
               )}
               <p className="text-xs text-gray-400 mt-3">
                 Showing {formatNumber(visibleMaterials.length)} of{' '}
                 {formatNumber(materials.length)} materials
-                {shortfallsOnly && ' (shortfalls only)'}
+                {materialFilterNote && ` (${materialFilterNote})`}
               </p>
+              {crossViewHint}
                 </>
               )}
             </div>

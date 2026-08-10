@@ -537,9 +537,13 @@ export type VarianceExportRequest = {
   palletView: boolean
   query: string
   shortfallsOnly: boolean
+  /** By-material view only: keep just the materials some load asks for. */
+  deliveriesOnly: boolean
   from: string
   to: string
   condition: ShippingCondition
+  /** Ship-from site (column W) the view is narrowed to; blank is every site. */
+  site: string
   materialSort: SortState<MaterialSortKey>
   loadSort: SortState<LoadSortKey>
   /** Formatted on the client, so the report is stamped in the reader's own time zone. */
@@ -604,6 +608,7 @@ export async function buildVarianceExport(request: VarianceExportRequest) {
     from: request.from,
     to: request.to,
     condition: request.condition,
+    site: request.site,
   })
 
   const context = {
@@ -611,9 +616,11 @@ export async function buildVarianceExport(request: VarianceExportRequest) {
     palletView: request.palletView,
     query: request.query,
     shortfallsOnly: request.shortfallsOnly,
+    deliveriesOnly: request.deliveriesOnly,
     from: request.from,
     to: request.to,
     condition: request.condition,
+    site: request.site,
     sources: reportsWithLines.map((r) => r.label),
     generatedAt: request.generatedAt,
     dateStamp: request.dateStamp,
@@ -632,6 +639,7 @@ export async function buildVarianceExport(request: VarianceExportRequest) {
     const visible = filterAndSortMaterials(materials, {
       query: request.query,
       shortfallsOnly: request.shortfallsOnly,
+      deliveriesOnly: request.deliveriesOnly,
       sort: request.materialSort,
     })
     doc = buildMaterialExport(visible, {
