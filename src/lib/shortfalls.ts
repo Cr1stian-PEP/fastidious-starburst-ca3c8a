@@ -276,3 +276,145 @@ export function topShortfallMaterials<T extends { requested: number; variance: n
     .sort((a, b) => a.variance - b.variance)
     .slice(0, limit)
 }
+
+/**
+ * The slice of the allocation that covers a given set of materials: each load
+ * cut down to its lines for those materials, with its totals rebuilt from what
+ * is left and loads that need none of them dropped.
+ *
+ * The allocation itself is **not** re-run. Which load got which cases is a
+ * property of the whole book — ship-date order over the whole demand — so a
+ * search must read a slice of that one answer rather than re-allocate the stock
+ * as though the unsearched loads weren't competing for it.
+ */
+export function restrictLoadsToMaterials(
+  loads: readonly LoadShortfall[],
+  materials: Iterable<string>,
+): LoadShortfall[] {
+  const wanted = new Set(materials)
+  const scoped: LoadShortfall[] = []
+
+  for (const load of loads) {
+    // Nothing to cut — keep the load exactly as the allocation left it.
+    if (load.lines.every((line) => wanted.has(line.material))) {
+      scoped.push(load)
+      continue
+    }
+
+    const lines = load.lines.filter((line) => wanted.has(line.material))
+    if (lines.length === 0) continue
+
+    let requested = 0
+    let totalOnHand = 0
+    let worstMaterial = ''
+    let worstShort = 0
+    for (const line of lines) {
+      requested += line.requested
+      totalOnHand += line.available
+      const short = line.requested - line.available
+      if (short > worstShort) {
+        worstShort = short
+        worstMaterial = line.material
+      }
+    }
+
+    scoped.push({
+      ...load,
+      materials: lines.map((line) => line.material),
+      lines,
+      requested,
+      totalOnHand,
+      variance: totalOnHand - requested,
+      worstMaterial: worstMaterial || lines[0].material,
+    })
+  }
+
+  return scoped
+}
+
+/**
+ * How much of what a load asks for the allocation actually gave it, as a
+ * percentage. A load asking for nothing is covered by definition rather than
+ * dividing by zero.
+ */
+export function loadAllocatedPercent(load: {
+  requested: number
+  totalOnHand: number
+}): number {
+  if (load.requested <= 0) return 100
+  return (load.totalOnHand / load.requested) * 100
+}
+
+/**
+ * How the loads in the current view came out of the allocation: how many are
+ * fully covered, how many are allocated enough of what they asked for to count,
+ * and how many are genuinely short.
+ *
+ * The allocation caps what a load gets at what it asks for, so a load's variance
+ * is never positive — "fully allocated" means a variance of zero, and the
+ * threshold widens that to loads allocated at least a given **percentage** of
+ * their demand. A percentage is the unit-free way to say it: cases-per-pallet
+ * differs by material, so "short by 60 cases" means something different on every
+ * load, while "95% allocated" reads the same whether the page is in cases or
+ * pallets and whether the load is one pallet or forty.
+ *
+ * Loads are returned alongside the counts so the caller can total them in
+ * whatever units the page is showing; a pallet total can only be built up from
+ * each load's own lines.
+ */
+export type AllocationSummary = {
+  /** Loads in the view. */
+  loads: number
+  /** Loads whose demand the allocation covered outright. */
+  covered: number
+  /** Loads short, but allocated at least the threshold percentage. */
+  withinTolerance: number
+  /** `covered + withinTolerance` — what the report calls fully allocated. */
+  allocated: number
+  /** Loads allocated less than the threshold. */
+  short: number
+  /** The short loads themselves, worst first. */
+  shortLoads: LoadShortfall[]
+  /** Demand-weighted coverage across the view, as a percentage. */
+  allocatedPercent: number
+}
+
+export function summarizeAllocation(
+  loads: readonly LoadShortfall[],
+  minAllocatedPercent = 100,
+): AllocationSummary {
+  const threshold = Math.min(100, Math.max(0, minAllocatedPercent))
+
+  let covered = 0
+  let withinTolerance = 0
+  let requested = 0
+  let allocatedCases = 0
+  const shortLoads: LoadShortfall[] = []
+
+  for (const load of loads) {
+    requested += load.requested
+    allocatedCases += load.totalOnHand
+
+    // Quantities come out of a spreadsheet and can carry a fractional tail, so a
+    // load short by a millionth of a case is covered, not short.
+    if (-load.variance <= 1e-9) {
+      covered += 1
+      continue
+    }
+    if (loadAllocatedPercent(load) >= threshold - 1e-9) withinTolerance += 1
+    else shortLoads.push(load)
+  }
+
+  shortLoads.sort((a, b) => a.variance - b.variance)
+
+  return {
+    loads: loads.length,
+    covered,
+    withinTolerance,
+    allocated: covered + withinTolerance,
+    short: shortLoads.length,
+    shortLoads,
+    allocatedPercent: loadAllocatedPercent({ requested, totalOnHand: allocatedCases }),
+  }
+}
+

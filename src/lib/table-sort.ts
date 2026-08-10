@@ -30,6 +30,19 @@ export type LoadSortKey =
   | 'requested'
   | 'variance'
 
+/**
+ * The delivery-line fields the material search reaches into. They identify a
+ * load, not a material, which is exactly why they are matched here: it is what
+ * lets a load number typed into the material table show the materials on that
+ * load, mirroring the load table reaching into its materials.
+ */
+export type MaterialDeliveryRow = {
+  orderNumber?: string
+  customerPO?: string
+  plantName?: string
+  soldTo?: string
+}
+
 // The fields these helpers actually read. Declared structurally rather than
 // imported because reports.server.ts is server-only.
 export type MaterialSortRow = {
@@ -38,6 +51,12 @@ export type MaterialSortRow = {
   totalOnHand: number
   requested: number
   variance: number
+  /**
+   * The material's delivery lines, as the demand filter left them. The count is
+   * what "has delivery lines" means in the current view; the load identifiers on
+   * them are what the search matches.
+   */
+  deliveries: readonly MaterialDeliveryRow[]
 }
 
 export type DeliverySortRow = {
@@ -89,18 +108,47 @@ export function nextSort<K extends string>(state: SortState<K>, key: K): SortSta
   return { key, dir: state.dir === 'asc' ? 'desc' : 'asc' }
 }
 
+/**
+ * Does any field hold what was typed? Used both by the table filters and by the
+ * expanded panels, so a row that survived the search can point at the line that
+ * kept it.
+ */
+export function matchesQuery(query: string, ...fields: Array<string | undefined>): boolean {
+  const q = query.trim().toLowerCase()
+  if (!q) return false
+  return fields.some((field) => (field ?? '').toLowerCase().includes(q))
+}
+
 export function filterAndSortMaterials<T extends MaterialSortRow>(
   rows: readonly T[],
-  options: { query: string; shortfallsOnly: boolean; sort: SortState<MaterialSortKey> },
+  options: {
+    query: string
+    shortfallsOnly: boolean
+    /**
+     * Keep only materials some load actually asks for. The lines are the ones
+     * the demand filter left, so a material whose only lines fall outside the
+     * ship-date window, condition or site drops with them.
+     */
+    deliveriesOnly?: boolean
+    sort: SortState<MaterialSortKey>
+  },
 ): T[] {
-  const { query, shortfallsOnly, sort } = options
+  const { query, shortfallsOnly, deliveriesOnly, sort } = options
   const q = query.trim().toLowerCase()
 
   let filtered = shortfallsOnly ? rows.filter((m) => m.variance < 0) : rows
+  if (deliveriesOnly) filtered = filtered.filter((m) => m.deliveries.length > 0)
   if (q) {
     filtered = filtered.filter(
       (m) =>
-        m.material.toLowerCase().includes(q) || m.materialName.toLowerCase().includes(q),
+        m.material.toLowerCase().includes(q) ||
+        m.materialName.toLowerCase().includes(q) ||
+        // A load number, PO, plant or ship-to belongs to the load rather than to
+        // the material, so matching them turns the material table into the
+        // answer to "what is on this load" instead of an empty result.
+        m.deliveries.some((d) =>
+          matchesQuery(q, d.orderNumber, d.customerPO, d.plantName, d.soldTo),
+        ),
     )
   }
 
@@ -133,6 +181,114 @@ export function sortDeliveries<T extends DeliverySortRow>(
 
     return dir * a[sort.key].localeCompare(b[sort.key])
   })
+}
+
+export type MaterialSuggestion = { material: string; materialName: string }
+
+/**
+ * Material suggestions for the search box: the materials whose number or name
+ * contains what has been typed, best match first — an exact material number,
+ * then a number the query starts, then a name it starts, then anything else that
+ * contains it. Ranking matters more than it looks: typing "10" should offer
+ * 10xxx before a name with "10" buried in it.
+ */
+export function suggestMaterials<T extends MaterialSuggestion>(
+  rows: readonly T[],
+  query: string,
+  limit = 8,
+): T[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return []
+
+  const scored: Array<{ row: T; rank: number }> = []
+  for (const row of rows) {
+    const material = row.material.toLowerCase()
+    const name = row.materialName.toLowerCase()
+
+    let rank: number
+    if (material === q) rank = 0
+    else if (material.startsWith(q)) rank = 1
+    else if (name.startsWith(q)) rank = 2
+    else if (material.includes(q)) rank = 3
+    else if (name.includes(q)) rank = 4
+    else continue
+
+    scored.push({ row, rank })
+  }
+
+  return scored
+    .sort((a, b) => {
+      if (a.rank !== b.rank) return a.rank - b.rank
+      return compareMaterialNumber(a.row.material, b.row.material)
+    })
+    .slice(0, limit)
+    .map((entry) => entry.row)
+}
+
+export type LoadSuggestion = {
+  key: string
+  orderNumber: string
+  customerPO: string
+  shipFrom?: string
+  shipTo?: string
+}
+
+/**
+ * Load suggestions for the search box, ranked the way `suggestMaterials` ranks
+ * materials: the load number first, then the Customer PO, then the plant it
+ * ships from or the party it ships to. A condition-01 pickup has no load number,
+ * so its PO is the only thing that can find it.
+ *
+ * Loads are *not* matched on the materials they carry — a material number
+ * already has a suggestion of its own, and offering the twenty loads that carry
+ * it instead would bury it.
+ */
+export function suggestLoads<T extends LoadSuggestion>(
+  rows: readonly T[],
+  query: string,
+  limit = 8,
+): T[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return []
+
+  const scored: Array<{ row: T; rank: number }> = []
+  for (const row of rows) {
+    const order = row.orderNumber.trim().toLowerCase()
+    const po = row.customerPO.trim().toLowerCase()
+
+    let rank: number
+    if (order === q || po === q) rank = 0
+    else if (order && order.startsWith(q)) rank = 1
+    else if (po && po.startsWith(q)) rank = 2
+    else if (order.includes(q) || po.includes(q)) rank = 3
+    else if (matchesQuery(q, row.shipFrom, row.shipTo)) rank = 4
+    else continue
+
+    scored.push({ row, rank })
+  }
+
+  return scored
+    .sort((a, b) => {
+      if (a.rank !== b.rank) return a.rank - b.rank
+      return a.row.key.localeCompare(b.row.key)
+    })
+    .slice(0, limit)
+    .map((entry) => entry.row)
+}
+
+/**
+ * Merge the two suggestion lists so the view you are in leads while the other
+ * kind stays reachable: the current view's matches keep `lead` places, the other
+ * kind fills the rest, and whichever side runs short gives its places back.
+ */
+export function mergeSuggestions<T>(
+  primary: readonly T[],
+  secondary: readonly T[],
+  limit = 8,
+  lead = 5,
+): T[] {
+  const keep = Math.min(primary.length, Math.max(lead, limit - secondary.length))
+  return [...primary.slice(0, keep), ...secondary.slice(0, limit - keep)]
 }
 
 export type FootprintSortKey = 'material' | 'materialName' | 'casesPerPallet' | 'source'
@@ -200,23 +356,52 @@ export function filterAndSortLoads<T extends LoadSortRow>(
 // matching what the app showed before the selector existed.
 export type ShippingCondition = '01' | '02' | 'both'
 
-// A ship-date range and a shipping condition both narrow the demand side of the
-// report: only delivery lines that survive both count, so `requested` and
-// `variance` are rebuilt from the survivors. Stock isn't dated or conditioned,
-// so it is left exactly as it was.
+// The delivery line fields the demand-side filter reads.
+export type DeliveryFilterRow = {
+  shipDate: string
+  quantity: number
+  shippingCondition?: string
+  /** Site the load ships from (column W) — what the site selector matches on. */
+  plantName?: string
+}
+
+/**
+ * Every site (ship-from plant, column W) named anywhere in the outbound loads
+ * report, in alphabetical order. Built from the unfiltered materials so choosing
+ * one doesn't collapse the list to the chosen one. Blank plants are left out —
+ * there is nothing to select.
+ */
+export function collectDeliverySites<
+  T extends { deliveries: readonly { plantName?: string }[] },
+>(materials: readonly T[]): string[] {
+  const sites = new Set<string>()
+  for (const material of materials) {
+    for (const delivery of material.deliveries) {
+      const site = delivery.plantName?.trim()
+      if (site) sites.add(site)
+    }
+  }
+  return [...sites].sort((a, b) => a.localeCompare(b))
+}
+
+// A ship-date range, a shipping condition and a site all narrow the demand side
+// of the report: only delivery lines that survive every one of them count, so
+// `requested` and `variance` are rebuilt from the survivors. Stock isn't dated,
+// conditioned or sited, so it is left exactly as it was.
 export function filterMaterialsByDelivery<
   T extends {
     requested: number
     variance: number
     totalOnHand: number
-    deliveries: Array<{ shipDate: string; quantity: number; shippingCondition?: string }>
+    deliveries: Array<DeliveryFilterRow>
   },
 >(
   materials: readonly T[],
-  options: { from: string; to: string; condition: ShippingCondition },
+  options: { from: string; to: string; condition: ShippingCondition; site?: string },
 ): T[] {
   const { from, to, condition } = options
-  if (!from && !to && condition === 'both') return materials as T[]
+  const site = options.site?.trim() ?? ''
+  if (!from && !to && condition === 'both' && !site) return materials as T[]
 
   // dateSortKey returns a Date.UTC value, so the date inputs parse straight
   // onto the same scale. Both ends are inclusive.
@@ -229,6 +414,8 @@ export function filterMaterialsByDelivery<
       // Lines stored before the condition was captured read as '02', which is
       // what the app showed when they were uploaded.
       if (condition !== 'both' && (d.shippingCondition || '02') !== condition) return false
+      // A line with no plant can't be shown to belong to the chosen site.
+      if (site && (d.plantName?.trim() ?? '') !== site) return false
       if (!rangeActive) return true
 
       const key = dateSortKey(d.shipDate)

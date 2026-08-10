@@ -39,9 +39,13 @@ export type ExportContext = {
   palletView: boolean
   query: string
   shortfallsOnly: boolean
+  /** By-material view only: the table was narrowed to materials some load asks for. */
+  deliveriesOnly: boolean
   from: string
   to: string
   condition: ShippingCondition
+  /** Ship-from site the demand side was narrowed to. Blank means every site. */
+  site: string
   /** Uploaded file names behind the numbers, so a saved export says where it came from. */
   sources: readonly string[]
   /** Formatted in the reader's own locale, on the client, for both export paths. */
@@ -121,7 +125,13 @@ function buildMeta(ctx: ExportContext): Array<[string, string]> {
     ],
     ['Ship date range', range],
     ['Shipping condition', conditionLabel(ctx.condition)],
+    ['Site', ctx.site.trim() || 'All sites'],
     ['Shortfalls only', ctx.shortfallsOnly ? 'Yes' : 'No'],
+    // A load only exists because of its delivery lines, so the filter is a
+    // material-view control and would read as noise on a load export.
+    ...(ctx.view === 'load'
+      ? []
+      : [['With delivery lines only', ctx.deliveriesOnly ? 'Yes' : 'No'] as [string, string]]),
     ['Search', ctx.query.trim() || 'None'],
     [
       ctx.view === 'load' ? 'Loads' : 'Materials',
