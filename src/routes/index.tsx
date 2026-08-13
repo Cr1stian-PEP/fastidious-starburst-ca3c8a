@@ -198,6 +198,11 @@ function Home() {
   // By-material view only: hide materials no load is asking for, so the table is
   // just the stock the outbound book actually touches.
   const [deliveriesOnly, setDeliveriesOnly] = useState(false)
+  // By-material view only: just the materials the schedule is making.
+  const [productionOnly, setProductionOnly] = useState(false)
+  // By-load view only: allocate finished stock alone, so the loads read as what
+  // could ship on what is physically here rather than on what is coming.
+  const [onHandOnly, setOnHandOnly] = useState(false)
   // Ship-date window on the demand side. Blank on either end is open-ended.
   const [shipFrom, setShipFrom] = useState('')
   const [shipTo, setShipTo] = useState('')
@@ -290,6 +295,8 @@ function Home() {
       setQuery('')
       setShortfallsOnly(false)
       setDeliveriesOnly(false)
+      setProductionOnly(false)
+      setOnHandOnly(false)
       setShipFrom('')
       setShipTo('')
       setSite('')
@@ -355,8 +362,17 @@ function Home() {
     () => topShortfallMaterials(materials, CHART_LIMIT),
     [materials],
   )
+  const loadView = chartGroup === 'load'
+  // Whether scheduled production counts as stock the loads can draw on. Turning
+  // it off is a by-load control — the material table's Stock on Hand column is
+  // finished + in production whichever way the button sits — so it only bites
+  // while that view is the one on screen.
+  const includeProduction = !(loadView && onHandOnly)
   // One allocation pass serves both the chart and the load table.
-  const loads = useMemo(() => summarizeLoads(materials), [materials])
+  const loads = useMemo(
+    () => summarizeLoads(materials, { includeProduction }),
+    [materials, includeProduction],
+  )
   const topLoads = useMemo(
     () =>
       loads
@@ -367,20 +383,27 @@ function Home() {
   )
 
   const visibleMaterials = useMemo(
-    () => filterAndSortMaterials(materials, { query, shortfallsOnly, deliveriesOnly, sort }),
-    [materials, query, shortfallsOnly, deliveriesOnly, sort],
+    () =>
+      filterAndSortMaterials(materials, {
+        query,
+        shortfallsOnly,
+        deliveriesOnly,
+        productionOnly,
+        sort,
+      }),
+    [materials, query, shortfallsOnly, deliveriesOnly, productionOnly, sort],
   )
   const visibleLoads = useMemo(
     () => filterAndSortLoads(loads, { query, shortfallsOnly, sort: loadSort }),
     [loads, query, shortfallsOnly, loadSort],
   )
-  const loadView = chartGroup === 'load'
 
   // Which filters are narrowing the material table, and — when they leave it
   // empty — which one to blame.
   const materialFilterNote = [
     shortfallsOnly && 'shortfalls only',
     deliveriesOnly && 'with delivery lines',
+    productionOnly && 'being produced',
   ]
     .filter(Boolean)
     .join(', ')
@@ -388,11 +411,15 @@ function Home() {
     ? query.trim()
       ? `No shortfalls match “${query}”.`
       : 'No shortfalls — every material has enough stock on hand.'
-    : deliveriesOnly
+    : productionOnly
       ? query.trim()
-        ? `No materials with delivery lines match “${query}”.`
-        : 'No material in this view has delivery lines.'
-      : `No materials match “${query}”.`
+        ? `No materials being produced match “${query}”.`
+        : 'Nothing in this view is on the production schedule.'
+      : deliveriesOnly
+        ? query.trim()
+          ? `No materials with delivery lines match “${query}”.`
+          : 'No material in this view has delivery lines.'
+        : `No materials match “${query}”.`
 
   // How the loads in this view came out of the allocation, for the read-out
   // above the table. It follows the table rather than the whole book: in load
@@ -427,6 +454,12 @@ function Home() {
     () => totalUnits(scopedLines, (line) => line.requested),
     [scopedLines],
   )
+  // How much of what those loads are counting on is still to be made — the part
+  // of "available" that isn't on the floor yet.
+  const toProduceTotal = useMemo(
+    () => totalUnits(scopedLines, (line) => line.fromProduction),
+    [scopedLines],
+  )
   const shortTotal = useMemo(
     () =>
       totalUnits(
@@ -438,7 +471,10 @@ function Home() {
   // Exactly what those figures cover, said out loud — the panel moves with the
   // search, so it has to name what it is counting.
   const allocationScope = useMemo(() => {
-    const filtered = Boolean(query.trim()) || shortfallsOnly || (!loadView && deliveriesOnly)
+    const filtered =
+      Boolean(query.trim()) ||
+      shortfallsOnly ||
+      (!loadView && (deliveriesOnly || productionOnly))
     if (!filtered) return 'Every load in the current view'
     if (loadView) {
       return `${formatNumber(visibleLoads.length)} of ${formatNumber(
@@ -454,6 +490,7 @@ function Home() {
     query,
     shortfallsOnly,
     deliveriesOnly,
+    productionOnly,
     loadView,
     visibleLoads.length,
     loads.length,
@@ -525,6 +562,8 @@ function Home() {
       query,
       shortfallsOnly,
       deliveriesOnly,
+      productionOnly,
+      onHandOnly: loadView && onHandOnly,
       from: shipFrom,
       to: shipTo,
       condition,
@@ -562,6 +601,8 @@ function Home() {
           query,
           shortfallsOnly,
           deliveriesOnly,
+          productionOnly,
+          onHandOnly: ctx.onHandOnly,
           from: shipFrom,
           to: shipTo,
           condition,
@@ -631,6 +672,7 @@ function Home() {
       const row = materials.find((m) => m.material === target.material)
       if (shortfallsOnly && row && row.variance >= 0) setShortfallsOnly(false)
       if (deliveriesOnly && row && row.deliveries.length === 0) setDeliveriesOnly(false)
+      if (productionOnly && row && row.inProduction <= 0) setProductionOnly(false)
     }
     setExpanded(target.material)
     setPendingReveal(target)
@@ -704,6 +746,15 @@ function Home() {
   useEffect(() => {
     if (site && !sites.includes(site)) setSite('')
   }, [site, sites])
+
+  // Both production controls are hidden once the production slot is cleared, so
+  // a left-on filter would have no button to turn it off again — and "being
+  // produced only" with no schedule empties the table outright.
+  useEffect(() => {
+    if (hasProduction) return
+    setProductionOnly(false)
+    setOnHandOnly(false)
+  }, [hasProduction])
 
   const chartData = {
     labels: chartRows.map((r) => r.label),
@@ -962,8 +1013,11 @@ function Home() {
                     </h2>
                     <p className="text-xs text-gray-400 mt-1 max-w-2xl">
                       {loadView
-                        ? 'Grouped by load number, filled in ship-date order: the stock a load can draw on is what is left after every earlier load has taken its share, so the two bars are that load’s own demand — what it can get against what it asks for. A pickup with no load number is labelled by its Customer PO. Click a bar to jump to that load’s row in the table below.'
+                        ? 'Grouped by load number, filled in ship-date order: the stock a load can draw on is what is left after every earlier load has taken its share, so the two bars are that load’s own demand — what it can get against what it asks for. Finished goods are drawn first, then the production schedule, so a load that needs stock still to be made is tagged in the table below. A pickup with no load number is labelled by its Customer PO. Click a bar to jump to that load’s row in the table below.'
                         : 'Grouped by material number. Click a bar to jump to that material’s row in the table below.'}
+                      {loadView && onHandOnly
+                        ? ' On Hand Only is on: scheduled production is excluded, so these bars are finished goods alone.'
+                        : ''}
                       {palletView
                         ? ' Bars follow Pallet View; materials with no footprint stay in cases.'
                         : ''}
@@ -1209,6 +1263,8 @@ function Home() {
                   availableNote={unkeyedNote(allocatedTotal, palletView)}
                   neededText={formatTotal(neededTotal, palletView)}
                   neededNote={unkeyedNote(neededTotal, palletView)}
+                  toProduceText={formatTotal(toProduceTotal, palletView)}
+                  awaitingProduction={allocation.awaitingProduction}
                   allocatedPercent={allocation.allocatedPercent}
                   loads={allocation.loads}
                   allocated={allocation.allocated}
@@ -1220,6 +1276,8 @@ function Home() {
                   query={query}
                   shortfallsOnly={shortfallsOnly}
                   deliveriesOnly={!loadView && deliveriesOnly}
+                  productionOnly={!loadView && productionOnly}
+                  onHandOnly={loadView && onHandOnly}
                   scopeNote={allocationScope}
                 />
               )}
@@ -1258,6 +1316,44 @@ function Home() {
                       {deliveriesOnly
                         ? 'With delivery lines: On'
                         : 'With Delivery Lines'}
+                    </button>
+                  )}
+                  {/* Only the material view has a "being produced" row to keep:
+                      every load row would pass it, and a production report has
+                      to be uploaded for it to mean anything at all. */}
+                  {!loadView && hasProduction && (
+                    <button
+                      type="button"
+                      onClick={() => setProductionOnly((v) => !v)}
+                      aria-pressed={productionOnly}
+                      title="Show only materials the production schedule is making"
+                      className={`inline-flex items-center gap-2 text-sm font-medium rounded-lg px-4 py-2 transition-colors ${
+                        productionOnly
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                    >
+                      <Factory className="w-4 h-4" />
+                      {productionOnly ? 'Being produced: On' : 'Being Produced'}
+                    </button>
+                  )}
+                  {/* The mirror of it in the load view: take the schedule back
+                      out of the allocation, so every load stands on finished
+                      stock alone and the ones leaning on production turn short. */}
+                  {loadView && hasProduction && (
+                    <button
+                      type="button"
+                      onClick={() => setOnHandOnly((v) => !v)}
+                      aria-pressed={onHandOnly}
+                      title="Allocate finished stock only — ignore what is still to be produced"
+                      className={`inline-flex items-center gap-2 text-sm font-medium rounded-lg px-4 py-2 transition-colors ${
+                        onHandOnly
+                          ? 'bg-gray-900 text-white'
+                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                    >
+                      <Warehouse className="w-4 h-4" />
+                      {onHandOnly ? 'On hand only: On' : 'On Hand Only'}
                     </button>
                   )}
                   <button
@@ -1348,6 +1444,13 @@ function Home() {
                           className="py-2 pr-4"
                         />
                         <SortHeader
+                          label="To Be Produced"
+                          sortKey="fromProduction"
+                          state={loadSort}
+                          onChange={setLoadSort}
+                          className="py-2 pr-4"
+                        />
+                        <SortHeader
                           label="Needed for Loads"
                           sortKey="requested"
                           state={loadSort}
@@ -1373,7 +1476,15 @@ function Home() {
                         const available = totalUnits(load.lines, (l) => l.available)
                         const needed = totalUnits(load.lines, (l) => l.requested)
                         const variance = totalUnits(load.lines, (l) => l.variance)
+                        const toProduce = totalUnits(load.lines, (l) => l.fromProduction)
                         const loadNumber = formatLoadNumber(load.orderNumber)
+                        // Covered only because the schedule is going to make
+                        // part of it: not the same as covered off the floor, so
+                        // it reads blue rather than green and carries a tag.
+                        const awaiting = load.awaitingProduction
+                        const productionNote = load.productionDates
+                          .map((date) => date || 'no date on the schedule')
+                          .join(' · ')
                         return (
                           <Fragment key={load.key}>
                             <tr
@@ -1405,6 +1516,20 @@ function Home() {
                                     No load #
                                   </span>
                                 )}
+                                {/* The tag is the point of the row for a
+                                    planner: this load is only whole because
+                                    something on it is still being made. */}
+                                {awaiting && (
+                                  <span
+                                    title={`Waiting on production${
+                                      productionNote ? ` — ${productionNote}` : ''
+                                    }`}
+                                    className="ml-2 inline-flex items-center gap-1 align-middle text-[11px] font-sans font-medium bg-blue-50 text-blue-700 border border-blue-100 rounded-full px-2 py-0.5"
+                                  >
+                                    <Factory className="w-3 h-3" />
+                                    To be produced
+                                  </span>
+                                )}
                               </td>
                               <td className="py-2 pr-4 text-gray-700">
                                 {formatCustomerPo(load.customerPO) || '—'}
@@ -1418,12 +1543,34 @@ function Home() {
                               <td className="py-2 pr-4 text-gray-600">
                                 {formatTotal(available, palletView)}
                               </td>
+                              {/* The part of "available" that isn't made yet,
+                                  with the dates it lands on underneath. */}
+                              <td className="py-2 pr-4">
+                                {awaiting ? (
+                                  <>
+                                    <span className="text-blue-700 font-medium">
+                                      {formatTotal(toProduce, palletView)}
+                                    </span>
+                                    {productionNote && (
+                                      <span className="block text-[11px] text-gray-400">
+                                        {productionNote}
+                                      </span>
+                                    )}
+                                  </>
+                                ) : (
+                                  <span className="text-gray-300">—</span>
+                                )}
+                              </td>
                               <td className="py-2 pr-4 text-gray-600">
                                 {formatTotal(needed, palletView)}
                               </td>
                               <td
                                 className={`py-2 font-semibold ${
-                                  flagged ? 'text-red-600' : 'text-emerald-600'
+                                  flagged
+                                    ? 'text-red-600'
+                                    : awaiting
+                                      ? 'text-blue-700'
+                                      : 'text-emerald-600'
                                 }`}
                               >
                                 {formatTotal(variance, palletView)}
@@ -1431,7 +1578,7 @@ function Home() {
                             </tr>
                             {isOpen && (
                               <tr className="bg-gray-50/60">
-                                <td colSpan={8} className="px-4 py-4">
+                                <td colSpan={9} className="px-4 py-4">
                                   {/* Where the load comes from and where it is
                                       going — one pair for the whole load, so it
                                       sits above the per-material table rather
@@ -1453,7 +1600,32 @@ function Home() {
                                         {load.shipTo || '—'}
                                       </dd>
                                     </div>
+                                    {/* Said once for the whole load, above the
+                                        per-material rows that break it down. */}
+                                    {awaiting && (
+                                      <div>
+                                        <dt className="text-[11px] uppercase tracking-wide text-blue-500">
+                                          To Be Produced
+                                        </dt>
+                                        <dd className="text-xs font-medium text-blue-700">
+                                          {formatTotal(toProduce, palletView)}
+                                          {productionNote && (
+                                            <span className="font-normal text-gray-500">
+                                              {' '}
+                                              · produced {productionNote}
+                                            </span>
+                                          )}
+                                        </dd>
+                                      </div>
+                                    )}
                                   </dl>
+                                  {awaiting && (
+                                    <p className="text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 mb-4">
+                                      This load is only covered once the
+                                      scheduled production below is made — the
+                                      cases are not on the floor yet.
+                                    </p>
+                                  )}
                                   <table className="w-full text-xs">
                                     <thead>
                                       <tr className="text-left text-gray-400 border-b border-gray-200">
@@ -1461,6 +1633,8 @@ function Home() {
                                         <th className="py-1 pr-4 font-medium">Name</th>
                                         <th className="py-1 pr-4 font-medium">Needed</th>
                                         <th className="py-1 pr-4 font-medium">Available</th>
+                                        <th className="py-1 pr-4 font-medium">On Hand Now</th>
+                                        <th className="py-1 pr-4 font-medium">To Be Produced</th>
                                         <th className="py-1 font-medium">Variance</th>
                                       </tr>
                                     </thead>
@@ -1503,6 +1677,45 @@ function Home() {
                                               palletView,
                                             )}
                                           </td>
+                                          <td className="py-1 pr-4 text-gray-700">
+                                            {formatQty(
+                                              line.fromFinished,
+                                              line.casesPerPallet,
+                                              palletView,
+                                            )}
+                                          </td>
+                                          {/* What is coming rather than here,
+                                              and the schedule dates it comes
+                                              off — the answer to "when". */}
+                                          <td className="py-1 pr-4">
+                                            {line.fromProduction > 0 ? (
+                                              <>
+                                                <span className="text-blue-700 font-medium">
+                                                  {formatQty(
+                                                    line.fromProduction,
+                                                    line.casesPerPallet,
+                                                    palletView,
+                                                  )}
+                                                </span>
+                                                <span className="block text-[11px] text-gray-500">
+                                                  {line.production
+                                                    .map(
+                                                      (slice) =>
+                                                        `${
+                                                          slice.date || 'no date'
+                                                        } · ${formatQty(
+                                                          slice.quantity,
+                                                          line.casesPerPallet,
+                                                          palletView,
+                                                        )}`,
+                                                    )
+                                                    .join('  |  ')}
+                                                </span>
+                                              </>
+                                            ) : (
+                                              <span className="text-gray-300">—</span>
+                                            )}
+                                          </td>
                                           <td
                                             className={`py-1 font-semibold ${
                                               line.variance < 0
@@ -1543,6 +1756,8 @@ function Home() {
                     Showing {formatNumber(visibleLoads.length)} of{' '}
                     {formatNumber(loads.length)} loads
                     {shortfallsOnly && ' (shortfalls only)'}
+                    {onHandOnly &&
+                      ' — allocated from finished goods only; scheduled production is excluded'}
                   </p>
                   {crossViewHint}
                 </>

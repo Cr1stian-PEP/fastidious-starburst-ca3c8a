@@ -124,6 +124,10 @@ export const exportVarianceWorkbook = createServerFn({ method: 'POST' })
       shortfallsOnly: z.boolean(),
       // By-material view only; the load view ignores it.
       deliveriesOnly: z.boolean(),
+      // By-material view only: just the materials the schedule is producing.
+      productionOnly: z.boolean(),
+      // By-load view only: allocate finished stock alone, ignoring the schedule.
+      onHandOnly: z.boolean(),
       // Blank on either end is open-ended, matching the date inputs.
       from: z.string().max(10),
       to: z.string().max(10),
@@ -141,6 +145,7 @@ export const exportVarianceWorkbook = createServerFn({ method: 'POST' })
           'shipDate',
           'materialCount',
           'totalOnHand',
+          'fromProduction',
           'requested',
           'variance',
         ]),

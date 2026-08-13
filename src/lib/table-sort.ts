@@ -27,6 +27,7 @@ export type LoadSortKey =
   | 'shipDate'
   | 'materialCount'
   | 'totalOnHand'
+  | 'fromProduction'
   | 'requested'
   | 'variance'
 
@@ -49,6 +50,8 @@ export type MaterialSortRow = {
   material: string
   materialName: string
   totalOnHand: number
+  /** Scheduled production — what "being produced" means to the filter below. */
+  inProduction: number
   requested: number
   variance: number
   /**
@@ -77,6 +80,8 @@ export type LoadSortRow = {
   shipTo?: string
   requested: number
   totalOnHand: number
+  /** How much of what the load is allocated has still to be produced. */
+  fromProduction?: number
   variance: number
   materials: readonly string[]
   lines: ReadonlyArray<{ material: string; materialName: string }>
@@ -130,14 +135,20 @@ export function filterAndSortMaterials<T extends MaterialSortRow>(
      * ship-date window, condition or site drops with them.
      */
     deliveriesOnly?: boolean
+    /**
+     * Keep only materials the production schedule is making — the stock that is
+     * coming rather than the stock that is already there.
+     */
+    productionOnly?: boolean
     sort: SortState<MaterialSortKey>
   },
 ): T[] {
-  const { query, shortfallsOnly, deliveriesOnly, sort } = options
+  const { query, shortfallsOnly, deliveriesOnly, productionOnly, sort } = options
   const q = query.trim().toLowerCase()
 
   let filtered = shortfallsOnly ? rows.filter((m) => m.variance < 0) : rows
   if (deliveriesOnly) filtered = filtered.filter((m) => m.deliveries.length > 0)
+  if (productionOnly) filtered = filtered.filter((m) => m.inProduction > 0)
   if (q) {
     filtered = filtered.filter(
       (m) =>
@@ -346,6 +357,12 @@ export function filterAndSortLoads<T extends LoadSortRow>(
 
     if (sort.key === 'customerPO') {
       return dir * a.customerPO.localeCompare(b.customerPO)
+    }
+
+    // A load with nothing on the schedule behind it has no production figure at
+    // all; it sorts as zero rather than as missing.
+    if (sort.key === 'fromProduction') {
+      return dir * ((a.fromProduction ?? 0) - (b.fromProduction ?? 0))
     }
 
     return dir * (a[sort.key] - b[sort.key])

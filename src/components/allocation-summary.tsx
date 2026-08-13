@@ -20,6 +20,8 @@ export function AllocationSummaryPanel({
   availableNote,
   neededText,
   neededNote,
+  toProduceText,
+  awaitingProduction,
   allocatedPercent,
   loads,
   allocated,
@@ -31,6 +33,8 @@ export function AllocationSummaryPanel({
   query,
   shortfallsOnly,
   deliveriesOnly,
+  productionOnly,
+  onHandOnly,
   scopeNote,
 }: {
   /** Stock the allocation left for these loads, formatted in the page's units. */
@@ -40,6 +44,10 @@ export function AllocationSummaryPanel({
   /** Total demand across the view, already formatted in the page's units. */
   neededText: string
   neededNote: string
+  /** How much of what is available has still to be produced, in the page's units. */
+  toProduceText: string
+  /** Loads counting on stock that isn't made yet. */
+  awaitingProduction: number
   /** Demand-weighted coverage across the view, as a percentage. */
   allocatedPercent: number
   loads: number
@@ -56,6 +64,10 @@ export function AllocationSummaryPanel({
   shortfallsOnly: boolean
   /** By-material view only: the table is down to materials some load asks for. */
   deliveriesOnly: boolean
+  /** By-material view only: the table is down to materials being produced. */
+  productionOnly: boolean
+  /** By-load view only: the allocation is running on finished stock alone. */
+  onHandOnly: boolean
   /** One sentence naming exactly what these figures cover. */
   scopeNote: string
 }) {
@@ -69,7 +81,10 @@ export function AllocationSummaryPanel({
           <h3 className="text-sm font-semibold text-gray-900">Load allocation</h3>
           <p className="text-xs text-gray-400 mt-0.5 max-w-xl">
             Stock is drawn down in ship-date order, so a load counts as allocated
-            only once enough of every material on it is left for it.
+            only once enough of every material on it is left for it.{' '}
+            {onHandOnly
+              ? 'Scheduled production is excluded here: these are finished goods only.'
+              : 'Finished goods go out first; anything a load has to reach into the production schedule for is flagged as still to be produced.'}
           </p>
           {/* The figures follow the search and the shortfalls filter, so both are
               named here rather than left to be inferred from the rows below. */}
@@ -87,6 +102,16 @@ export function AllocationSummaryPanel({
             {deliveriesOnly && (
               <span className="inline-flex items-center text-xs font-medium bg-amber-50 text-amber-700 border border-amber-100 rounded-full px-2.5 py-0.5">
                 With delivery lines only
+              </span>
+            )}
+            {productionOnly && (
+              <span className="inline-flex items-center text-xs font-medium bg-blue-50 text-blue-700 border border-blue-100 rounded-full px-2.5 py-0.5">
+                Being produced only
+              </span>
+            )}
+            {onHandOnly && (
+              <span className="inline-flex items-center text-xs font-medium bg-gray-900 text-white border border-gray-900 rounded-full px-2.5 py-0.5">
+                On hand only
               </span>
             )}
             <span className="text-xs text-gray-400">{scopeNote}</span>
@@ -142,6 +167,15 @@ export function AllocationSummaryPanel({
               .filter(Boolean)
               .join(' · ')}
           </p>
+          {/* Cases that are only available because the schedule is going to
+              make them aren't on the floor, so the tile says how much of the
+              figure above is still to come. */}
+          {awaitingProduction > 0 && (
+            <p className="text-xs font-medium text-blue-600 mt-1">
+              includes {toProduceText} to be produced · {formatNumber(awaitingProduction)}{' '}
+              load{awaitingProduction === 1 ? '' : 's'} waiting on it
+            </p>
+          )}
         </div>
 
         <div className="bg-white rounded-lg px-4 py-3 shadow-sm">

@@ -15,10 +15,22 @@ export type ShortfallDelivery = {
   soldTo?: string
 }
 
+/** A quantity the production schedule commits on one date. */
+export type ProductionSlice = {
+  /** Schedule date, or '' when the schedule rows carried none. */
+  date: string
+  quantity: number
+}
+
 export type ShortfallMaterial = {
   material: string
   materialName: string
+  /** Finished stock plus scheduled production. */
   totalOnHand: number
+  /** Finished stock on its own — what is physically there today. */
+  finished: number
+  /** Scheduled production per date, earliest first. */
+  production: readonly ProductionSlice[]
   requested: number
   variance: number
   casesPerPallet?: number | null
@@ -31,8 +43,14 @@ export type LoadLine = {
   materialName: string
   /** What this load asks for. */
   requested: number
-  /** What the allocation gave it. */
+  /** What the allocation gave it — finished stock plus scheduled production. */
   available: number
+  /** Of `available`, the part that is finished and on the floor today. */
+  fromFinished: number
+  /** Of `available`, the part that still has to be produced. */
+  fromProduction: number
+  /** Which schedule dates that production comes off, earliest first. */
+  production: ProductionSlice[]
   /** `available - requested`. */
   variance: number
   casesPerPallet: number | null
@@ -70,6 +88,18 @@ export type LoadShortfall = {
    * against `requested` — a covered load shows the two as equal.
    */
   totalOnHand: number
+  /** Of `totalOnHand`, the part that is finished stock today. */
+  fromFinished: number
+  /** Of `totalOnHand`, the part the schedule has still to produce. */
+  fromProduction: number
+  /**
+   * True when any of what this load is counting on has yet to be made. Such a
+   * load is not covered by stock on the floor, however its variance reads, so
+   * the table tags it rather than showing it as simply fine.
+   */
+  awaitingProduction: boolean
+  /** Distinct schedule dates that production comes off, earliest first. */
+  productionDates: string[]
   /** `totalOnHand - requested` — the cases this load is short. */
   variance: number
   /** The material short the most cases on this load, used as the jump target from the chart. */
@@ -119,9 +149,90 @@ export function deliveryLoadKey(delivery: ShortfallDelivery): string {
   return ''
 }
 
+/** Fractions of a case are spreadsheet noise, not stock. */
+const EPSILON = 1e-9
+
+// Quantities the schedule still owes for one material, earliest date first, as a
+// queue the allocation draws down. Undated schedule rows keep their place at the
+// back — production that exists but can't say when.
+function productionQueue(material: ShortfallMaterial): ProductionSlice[] {
+  const scheduled = Math.max(material.totalOnHand - material.finished, 0)
+  if (scheduled <= EPSILON) return []
+
+  const entries = [...(material.production ?? [])].sort((a, b) => {
+    const ka = dateSortKey(a.date)
+    const kb = dateSortKey(b.date)
+    if (ka === kb) return 0
+    if (!Number.isFinite(ka)) return 1
+    if (!Number.isFinite(kb)) return -1
+    return ka - kb
+  })
+
+  const slices: ProductionSlice[] = []
+  let counted = 0
+  for (const entry of entries) {
+    const room = scheduled - counted
+    if (room <= EPSILON) break
+    const quantity = Math.min(Math.max(entry.quantity, 0), room)
+    if (quantity <= EPSILON) continue
+    slices.push({ date: entry.date, quantity })
+    counted += quantity
+  }
+  // Production the material carries without a dated block behind it still
+  // counts; the report just can't say when it lands.
+  if (scheduled - counted > EPSILON) slices.push({ date: '', quantity: scheduled - counted })
+
+  return slices
+}
+
+// Dates from a set of per-line draws, deduplicated and back in schedule order,
+// so a load can say when the stock it is waiting on is made.
+function mergeProductionDates(lines: readonly LoadLine[]): string[] {
+  const dates = new Set<string>()
+  for (const line of lines) {
+    for (const slice of line.production) dates.add(slice.date)
+  }
+  return [...dates].sort((a, b) => {
+    const ka = dateSortKey(a)
+    const kb = dateSortKey(b)
+    if (ka === kb) return 0
+    if (!Number.isFinite(ka)) return 1
+    if (!Number.isFinite(kb)) return -1
+    return ka - kb
+  })
+}
+
+/** The finished/production split of a load, rebuilt from whatever lines it has. */
+function productionTotals(lines: readonly LoadLine[]) {
+  let fromFinished = 0
+  let fromProduction = 0
+  for (const line of lines) {
+    fromFinished += line.fromFinished
+    fromProduction += line.fromProduction
+  }
+  return {
+    fromFinished,
+    fromProduction,
+    awaitingProduction: fromProduction > EPSILON,
+    productionDates: mergeProductionDates(lines),
+  }
+}
+
+export type AllocationOptions = {
+  /**
+   * Whether scheduled production counts as stock a load can draw on. Turning it
+   * off answers "what could ship on what is finished today" — every load then
+   * stands on finished stock alone, and one leaning on production turns from
+   * tagged to genuinely short.
+   */
+  includeProduction?: boolean
+}
+
 export function groupShortfallsByLoad(
   materials: readonly ShortfallMaterial[],
+  options: AllocationOptions = {},
 ): LoadShortfall[] {
+  const includeProduction = options.includeProduction !== false
   const byLoad = new Map<string, LoadEntry>()
   // Names and footprints live on the material, not the delivery line, so the
   // per-load breakdown reads them back out here.
@@ -183,8 +294,18 @@ export function groupShortfallsByLoad(
   // material down as it is committed. What a load gets is therefore what is
   // genuinely still there for it, and undated loads sort last because they
   // cannot claim priority over a load with a date on it.
-  const remaining = new Map(
-    materials.map((m) => [m.material, Math.max(m.totalOnHand, 0)] as const),
+  //
+  // Finished stock and scheduled production are drawn from separately, finished
+  // first: a load covered only because something on it is still to be made is
+  // not in the same position as one covered off the floor, and the report has
+  // to be able to say which it is — and when the production lands.
+  const remainingFinished = new Map(
+    materials.map((m) => [m.material, Math.max(m.finished, 0)] as const),
+  )
+  const remainingProduction = new Map(
+    materials.map(
+      (m) => [m.material, includeProduction ? productionQueue(m) : []] as const,
+    ),
   )
 
   const ordered = [...byLoad.values()].sort((a, b) => {
@@ -201,9 +322,29 @@ export function groupShortfallsByLoad(
     const lines: LoadLine[] = []
 
     for (const [material, demand] of entry.demand) {
-      const stock = remaining.get(material) ?? 0
-      const covered = Math.min(demand, stock)
-      remaining.set(material, stock - covered)
+      const finishedLeft = remainingFinished.get(material) ?? 0
+      const fromFinished = Math.min(demand, finishedLeft)
+      remainingFinished.set(material, finishedLeft - fromFinished)
+
+      // Whatever finished stock couldn't cover comes off the schedule, in date
+      // order, so the load records the dates the cases it is waiting on are made.
+      let outstanding = demand - fromFinished
+      let fromProduction = 0
+      const production: ProductionSlice[] = []
+      const queue = remainingProduction.get(material)
+      while (queue && queue.length > 0 && outstanding > EPSILON) {
+        const slice = queue[0]
+        const take = Math.min(slice.quantity, outstanding)
+        if (take > EPSILON) {
+          production.push({ date: slice.date, quantity: take })
+          fromProduction += take
+          outstanding -= take
+        }
+        slice.quantity -= take
+        if (slice.quantity <= EPSILON) queue.shift()
+      }
+
+      const covered = fromFinished + fromProduction
       totalOnHand += covered
 
       lines.push({
@@ -211,6 +352,9 @@ export function groupShortfallsByLoad(
         materialName: meta.get(material)?.name ?? material,
         requested: demand,
         available: covered,
+        fromFinished,
+        fromProduction,
+        production,
         variance: covered - demand,
         casesPerPallet: meta.get(material)?.casesPerPallet ?? null,
       })
@@ -234,6 +378,7 @@ export function groupShortfallsByLoad(
       lines,
       requested: entry.requested,
       totalOnHand,
+      ...productionTotals(lines),
       variance: totalOnHand - entry.requested,
       // Nothing short means no driving material; fall back to the first one so
       // a bar click still lands somewhere useful.
@@ -250,16 +395,20 @@ export function groupShortfallsByLoad(
  * chart filters it down. Both go through one allocation pass so the numbers
  * can't disagree.
  */
-export function summarizeLoads(materials: readonly ShortfallMaterial[]): LoadShortfall[] {
-  return groupShortfallsByLoad(materials)
+export function summarizeLoads(
+  materials: readonly ShortfallMaterial[],
+  options: AllocationOptions = {},
+): LoadShortfall[] {
+  return groupShortfallsByLoad(materials, options)
 }
 
 /** Worst shortfall first. Only rows that are actually short are worth charting. */
 export function topShortfallLoads(
   materials: readonly ShortfallMaterial[],
   limit: number,
+  options: AllocationOptions = {},
 ): LoadShortfall[] {
-  return summarizeLoads(materials)
+  return summarizeLoads(materials, options)
     .filter((load) => load.variance < 0)
     .sort((a, b) => a.variance - b.variance)
     .slice(0, limit)
@@ -324,6 +473,7 @@ export function restrictLoadsToMaterials(
       lines,
       requested,
       totalOnHand,
+      ...productionTotals(lines),
       variance: totalOnHand - requested,
       worstMaterial: worstMaterial || lines[0].material,
     })
@@ -375,6 +525,12 @@ export type AllocationSummary = {
   short: number
   /** The short loads themselves, worst first. */
   shortLoads: LoadShortfall[]
+  /**
+   * Loads leaning on stock that has still to be produced. Counted separately
+   * from `short` because they are a different problem: the cases are coming,
+   * but they are not on the floor yet.
+   */
+  awaitingProduction: number
   /** Demand-weighted coverage across the view, as a percentage. */
   allocatedPercent: number
 }
@@ -389,11 +545,13 @@ export function summarizeAllocation(
   let withinTolerance = 0
   let requested = 0
   let allocatedCases = 0
+  let awaitingProduction = 0
   const shortLoads: LoadShortfall[] = []
 
   for (const load of loads) {
     requested += load.requested
     allocatedCases += load.totalOnHand
+    if (load.awaitingProduction) awaitingProduction += 1
 
     // Quantities come out of a spreadsheet and can carry a fractional tail, so a
     // load short by a millionth of a case is covered, not short.
@@ -414,6 +572,7 @@ export function summarizeAllocation(
     allocated: covered + withinTolerance,
     short: shortLoads.length,
     shortLoads,
+    awaitingProduction,
     allocatedPercent: loadAllocatedPercent({ requested, totalOnHand: allocatedCases }),
   }
 }
