@@ -41,6 +41,10 @@ export type ExportContext = {
   shortfallsOnly: boolean
   /** By-material view only: the table was narrowed to materials some load asks for. */
   deliveriesOnly: boolean
+  /** By-material view only: the table was narrowed to materials being produced. */
+  productionOnly: boolean
+  /** By-load view only: scheduled production was excluded from the allocation. */
+  onHandOnly: boolean
   from: string
   to: string
   condition: ShippingCondition
@@ -77,6 +81,8 @@ export type ExportMaterialRow = {
   variance: number
   casesPerPallet: number | null
   deliveries: readonly ExportDeliveryLine[]
+  /** What the schedule makes and when, as the expanded row shows it. */
+  production: readonly { date: string; quantity: number }[]
 }
 
 // Exported quantities are the quantities on screen: `formatQty` rounds to whole
@@ -130,8 +136,18 @@ function buildMeta(ctx: ExportContext): Array<[string, string]> {
     // A load only exists because of its delivery lines, so the filter is a
     // material-view control and would read as noise on a load export.
     ...(ctx.view === 'load'
-      ? []
-      : [['With delivery lines only', ctx.deliveriesOnly ? 'Yes' : 'No'] as [string, string]]),
+      ? [
+          [
+            'Scheduled production',
+            ctx.onHandOnly
+              ? 'Excluded — allocated from finished stock only'
+              : 'Included in what a load can draw on',
+          ] as [string, string],
+        ]
+      : [
+          ['With delivery lines only', ctx.deliveriesOnly ? 'Yes' : 'No'] as [string, string],
+          ['Being produced only', ctx.productionOnly ? 'Yes' : 'No'] as [string, string],
+        ]),
     ['Search', ctx.query.trim() || 'None'],
     [
       ctx.view === 'load' ? 'Loads' : 'Materials',
@@ -208,11 +224,28 @@ export function buildMaterialExport(
     ),
   }
 
+  // What the schedule commits and when — the "Scheduled production" block of an
+  // expanded row, for every exported material at once. Left out entirely when no
+  // production report is behind the view, rather than exported as an empty sheet.
+  const production: ExportTable = {
+    name: 'Scheduled production',
+    columns: ['Material', 'Name', 'Production Date', 'Quantity', ...unitColumn],
+    rows: rows.flatMap((row) =>
+      row.production.map((entry) => [
+        row.material,
+        row.materialName,
+        entry.date || 'No date on the schedule',
+        qty(entry.quantity, row.casesPerPallet, palletView),
+        ...(palletView ? [unitLabel(row.casesPerPallet, palletView)] : []),
+      ]),
+    ),
+  }
+
   return {
     title: 'Material stock variance — by material',
     fileName: `variance-by-material-${ctx.dateStamp}`,
     meta: buildMeta(ctx),
-    tables: [summary, detail],
+    tables: production.rows.length > 0 ? [summary, detail, production] : [summary, detail],
   }
 }
 
@@ -239,6 +272,15 @@ export function buildLoadExport(
     return load.lines.some((line) => line.casesPerPallet) ? 'pl' : 'cs'
   }
 
+  // A load standing partly on stock that has yet to be made is not covered off
+  // the floor, however its variance reads, so the export says so in a column of
+  // its own rather than leaving the reader to infer it.
+  function loadStatus(load: LoadShortfall) {
+    if (load.variance < 0) return 'Short'
+    if (load.awaitingProduction) return 'To be produced'
+    return 'Covered'
+  }
+
   const summary: ExportTable = {
     name: 'Variance by load',
     columns: [
@@ -249,8 +291,12 @@ export function buildLoadExport(
       'Ship To',
       'Materials',
       'Stock Available',
+      'On Hand Now',
+      'To Be Produced',
+      'Production Dates',
       'Needed for Loads',
       'Variance',
+      'Status',
       ...(palletView ? ['Unit'] : []),
     ],
     rows: loads.map((load) => [
@@ -261,8 +307,12 @@ export function buildLoadExport(
       load.shipTo,
       load.materials.length,
       loadTotal(load, (line) => line.available),
+      loadTotal(load, (line) => line.fromFinished),
+      loadTotal(load, (line) => line.fromProduction),
+      load.productionDates.map((date) => date || 'No date').join(', '),
       loadTotal(load, (line) => line.requested),
       loadTotal(load, (line) => line.variance),
+      loadStatus(load),
       ...(palletView ? [loadUnit(load)] : []),
     ]),
   }
@@ -276,6 +326,9 @@ export function buildLoadExport(
       'Name',
       'Needed',
       'Available',
+      'On Hand Now',
+      'To Be Produced',
+      'Production Dates',
       'Variance',
       'Cases per Pallet',
       ...(palletView ? ['Unit'] : []),
@@ -288,6 +341,18 @@ export function buildLoadExport(
         line.materialName,
         qty(line.requested, line.casesPerPallet, palletView),
         qty(line.available, line.casesPerPallet, palletView),
+        qty(line.fromFinished, line.casesPerPallet, palletView),
+        qty(line.fromProduction, line.casesPerPallet, palletView),
+        line.production
+          .map(
+            (slice) =>
+              `${slice.date || 'No date'}: ${qty(
+                slice.quantity,
+                line.casesPerPallet,
+                palletView,
+              )}`,
+          )
+          .join(', '),
         qty(line.variance, line.casesPerPallet, palletView),
         line.casesPerPallet ?? '',
         ...(palletView ? [unitLabel(line.casesPerPallet, palletView)] : []),

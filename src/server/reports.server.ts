@@ -574,6 +574,10 @@ export type VarianceExportRequest = {
   shortfallsOnly: boolean
   /** By-material view only: keep just the materials some load asks for. */
   deliveriesOnly: boolean
+  /** By-material view only: keep just the materials the schedule is producing. */
+  productionOnly: boolean
+  /** By-load view only: allocate finished stock alone, ignoring the schedule. */
+  onHandOnly: boolean
   from: string
   to: string
   condition: ShippingCondition
@@ -652,6 +656,8 @@ export async function buildVarianceExport(sessionId: string, request: VarianceEx
     query: request.query,
     shortfallsOnly: request.shortfallsOnly,
     deliveriesOnly: request.deliveriesOnly,
+    productionOnly: request.productionOnly,
+    onHandOnly: request.onHandOnly,
     from: request.from,
     to: request.to,
     condition: request.condition,
@@ -663,7 +669,9 @@ export async function buildVarianceExport(sessionId: string, request: VarianceEx
 
   let doc: ExportDocument
   if (request.view === 'load') {
-    const loads = summarizeLoads(materials)
+    // The on-hand-only toggle is part of the allocation, not of the filter, so
+    // the export has to run the same pass the screen did.
+    const loads = summarizeLoads(materials, { includeProduction: !request.onHandOnly })
     const visible = filterAndSortLoads(loads, {
       query: request.query,
       shortfallsOnly: request.shortfallsOnly,
@@ -675,6 +683,7 @@ export async function buildVarianceExport(sessionId: string, request: VarianceEx
       query: request.query,
       shortfallsOnly: request.shortfallsOnly,
       deliveriesOnly: request.deliveriesOnly,
+      productionOnly: request.productionOnly,
       sort: request.materialSort,
     })
     doc = buildMaterialExport(visible, {
