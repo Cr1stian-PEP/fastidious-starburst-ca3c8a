@@ -1892,49 +1892,42 @@ function Home() {
                                   </div>
                                 )}
                               </div>
-                              {/* What the schedule actually commits, and when.
-                                  Nothing in production means nothing to show. */}
-                              {row.inProduction > 0 &&
-                                (row.production.length > 0 ? (
-                                  <div className="mb-4">
-                                    <p className="text-xs font-semibold text-gray-500 mb-1">
-                                      Scheduled production
-                                    </p>
-                                    <table className="w-full text-xs">
-                                      <thead>
-                                        <tr className="text-left text-gray-400 border-b border-gray-200">
-                                          <th className="py-1 pr-4 font-medium">Date</th>
-                                          <th className="py-1 font-medium">Quantity</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {row.production.map((entry, i) => (
-                                          <tr
-                                            key={`${entry.date}-${i}`}
-                                            className="border-b border-gray-100 last:border-0"
-                                          >
-                                            <td className="py-1 pr-4 text-gray-700">
-                                              {entry.date || 'No date on the schedule'}
-                                            </td>
-                                            <td className="py-1 text-gray-700">
-                                              {formatQty(
-                                                entry.quantity,
-                                                row.casesPerPallet,
-                                                palletView,
-                                              )}
-                                            </td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                  </div>
-                                ) : (
-                                  <p className="text-xs text-gray-500 mb-4">
-                                    <span className="font-semibold">Scheduled production:</span>{' '}
-                                    {formatQty(row.inProduction, row.casesPerPallet, palletView)} —
-                                    the schedule rows carried no date.
+                              {/* What the schedule still commits, and when. A run
+                                  whose date already passed no longer counts here,
+                                  so every remaining entry has a real upcoming date
+                                  and nothing in production means nothing to show. */}
+                              {row.production.length > 0 && (
+                                <div className="mb-4">
+                                  <p className="text-xs font-semibold text-gray-500 mb-1">
+                                    Scheduled production
                                   </p>
-                                ))}
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr className="text-left text-gray-400 border-b border-gray-200">
+                                        <th className="py-1 pr-4 font-medium">Date</th>
+                                        <th className="py-1 font-medium">Quantity</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {row.production.map((entry, i) => (
+                                        <tr
+                                          key={`${entry.date}-${i}`}
+                                          className="border-b border-gray-100 last:border-0"
+                                        >
+                                          <td className="py-1 pr-4 text-gray-700">{entry.date}</td>
+                                          <td className="py-1 text-gray-700">
+                                            {formatQty(
+                                              entry.quantity,
+                                              row.casesPerPallet,
+                                              palletView,
+                                            )}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              )}
                               {row.deliveries.length === 0 ? (
                                 <p className="text-sm text-gray-400">
                                   No delivery lines for this material.
