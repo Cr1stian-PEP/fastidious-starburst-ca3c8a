@@ -97,14 +97,64 @@ export function compareMaterialNumber(a: string, b: string): number {
   return a.localeCompare(b)
 }
 
-// Dates arrive as "m/d/yy" text, which sorts wrong as a string ("10/1/26" would
-// come before "7/29/26"), so compare on the parsed day instead.
+const MONTH_NAMES: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+}
+
+// Month-name dates: "FRI SEP 18 2026", "18-Sep-26", "September 18, 2026". The
+// production schedule export uses the first of those, so this is not a nicety —
+// a date this can't read counts as undated everywhere downstream. Weekday and
+// month abbreviations share no three-letter prefix, so a leading weekday needs
+// no special case: it simply isn't a month and is skipped.
+function namedDateKey(text: string): number | null {
+  let month: number | null = null
+  let day: number | null = null
+  let year: number | null = null
+
+  for (const token of text.split(/[^a-z0-9]+/i)) {
+    if (!token) continue
+    if (/^[a-z]+$/i.test(token)) {
+      const named = MONTH_NAMES[token.slice(0, 3).toLowerCase()]
+      if (named !== undefined && month === null) month = named
+      continue
+    }
+    if (!/^[0-9]+$/.test(token)) return null
+    const value = Number(token)
+    // A four-digit number is a year; otherwise the first 1-31 is the day and
+    // whatever is left over is a two-digit year.
+    if (token.length === 4) {
+      if (year === null) year = value
+    } else if (day === null && value >= 1 && value <= 31) {
+      day = value
+    } else if (year === null) {
+      year = value < 100 ? 2000 + value : value
+    }
+  }
+
+  if (month === null || day === null || year === null) return null
+  return Date.UTC(year, month, day)
+}
+
+// Dates arrive as text, which sorts wrong as a string ("10/1/26" would come
+// before "7/29/26"), so compare on the parsed day instead. This is the one
+// place a report date becomes a comparable day — the tables, the ship-date
+// range, the production queue and the already-produced check all run through
+// it — so a format it can't read reads as no date at all.
 export function dateSortKey(text: string): number {
-  const match = text.match(/^([0-9]{1,2})\/([0-9]{1,2})\/([0-9]{2,4})$/)
-  if (!match) return Number.POSITIVE_INFINITY
-  const [, month, day, rawYear] = match
-  const year = rawYear.length <= 2 ? 2000 + Number(rawYear) : Number(rawYear)
-  return Date.UTC(year, Number(month) - 1, Number(day))
+  const trimmed = text.trim()
+
+  const slashed = trimmed.match(/^([0-9]{1,2})\/([0-9]{1,2})\/([0-9]{2,4})$/)
+  if (slashed) {
+    const [, month, day, rawYear] = slashed
+    const year = rawYear.length <= 2 ? 2000 + Number(rawYear) : Number(rawYear)
+    return Date.UTC(year, Number(month) - 1, Number(day))
+  }
+
+  const iso = trimmed.match(/^([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})$/)
+  if (iso) return Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]))
+
+  return namedDateKey(trimmed) ?? Number.POSITIVE_INFINITY
 }
 
 // Clicking a new column sorts it ascending; clicking the active column flips it.

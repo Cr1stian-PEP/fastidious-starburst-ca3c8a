@@ -112,6 +112,17 @@ function cellToNumber(value: unknown): number {
 // "46232". Convert those; anything already readable passes through untouched.
 function cellToDateString(value: unknown): string {
   const text = cellToString(value)
+
+  // A column whose Excel number format includes a time part (even a date-only
+  // field is often really a datetime sitting at midnight) renders as
+  // "9/17/2026 0:00" rather than "9/17/26". Keep just the date portion so this
+  // still matches dateSortKey's m/d/y pattern instead of silently becoming an
+  // unparseable date everywhere downstream.
+  const withTime = text.match(
+    /^([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{2,4})\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\s*(?:AM|PM)?$/i,
+  )
+  if (withTime) return withTime[1]
+
   if (!/^[0-9]{4,6}(\.[0-9]+)?$/.test(text)) return text
 
   const serial = Number(text)
@@ -432,9 +443,22 @@ export type MaterialRow = {
   production: ProductionDetail[]
 }
 
+// A scheduled run only counts as stock-to-come while it's still ahead of
+// today: once its date has passed, the plant has already run it, and by now
+// it belongs in the materials report's finished count, not here. A date that
+// can't be parsed (the undated rows above a schedule's first date heading)
+// can't be shown to be still upcoming either, so it doesn't count.
+function isPendingProductionDate(date: string, today: Date): boolean {
+  const key = dateSortKey(date)
+  if (!Number.isFinite(key)) return false
+  const todayKey = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate())
+  return key >= todayKey
+}
+
 export function computeMaterialSummary(
   reportsWithLines: Awaited<ReturnType<typeof getAllReports>>,
   footprints: Record<string, number> = BASELINE_FOOTPRINTS,
+  today: Date = new Date(),
 ): MaterialRow[] {
   const productionLines = reportsWithLines.find((r) => r.type === 'production')?.lines ?? []
   const materialsLines = reportsWithLines.find((r) => r.type === 'materials')?.lines ?? []
@@ -452,11 +476,16 @@ export function computeMaterialSummary(
   // Name precedence: materials > production > delivery, per the materials report
   // being the canonical source for material names.
   for (const line of productionLines) {
-    inProduction.set(line.material, (inProduction.get(line.material) ?? 0) + line.quantity)
     if (!names.has(line.material) && line.materialName) names.set(line.material, line.materialName)
 
-    const byDate = production.get(line.material) ?? new Map<string, number>()
+    // A run whose date has already passed (or that never had one) is already
+    // off the schedule and onto the floor, so it stops counting as production
+    // here — see isPendingProductionDate above.
     const date = line.productionDate ?? ''
+    if (!isPendingProductionDate(date, today)) continue
+
+    inProduction.set(line.material, (inProduction.get(line.material) ?? 0) + line.quantity)
+    const byDate = production.get(line.material) ?? new Map<string, number>()
     byDate.set(date, (byDate.get(date) ?? 0) + line.quantity)
     production.set(line.material, byDate)
   }
