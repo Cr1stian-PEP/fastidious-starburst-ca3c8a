@@ -52,6 +52,15 @@ function isStale(lastSeenAt: Date | null): boolean {
   return Date.now() - lastSeenAt.getTime() > SESSION_IDLE_MS
 }
 
+// Pushes the idle window out to now. The window is measured from the last time
+// the session was used, so every path that uses one refreshes it.
+async function touch(id: string): Promise<void> {
+  await db
+    .update(reportSessions)
+    .set({ lastSeenAt: new Date() })
+    .where(eq(reportSessions.id, id))
+}
+
 /**
  * Deletes each session row and every report it owns. Called for sessions that
  * have gone idle and for a cookie pointing at a session that no longer exists.
@@ -117,10 +126,7 @@ export async function ensureSession(): Promise<string> {
     if (session && !isStale(session.lastSeenAt)) {
       // Keeps the session alive for as long as it is being used, so the idle
       // window is measured from the last request rather than from the first.
-      await db
-        .update(reportSessions)
-        .set({ lastSeenAt: new Date() })
-        .where(eq(reportSessions.id, cookie))
+      await touch(cookie)
       return cookie
     }
 
@@ -130,6 +136,39 @@ export async function ensureSession(): Promise<string> {
   }
 
   return startSession()
+}
+
+/**
+ * Refreshes the idle window for the session the request already has, and
+ * reports whether it is still there.
+ *
+ * Searching, filtering, sorting and expanding rows all happen in the browser,
+ * so somebody working through a report makes no requests at all — and would sit
+ * out the idle window with the whole report still on screen, only to find the
+ * uploads gone the next time anything did reach the server. The dashboard pings
+ * this while the tab is being used, so the window runs from what the person
+ * last did rather than from the last upload.
+ *
+ * Unlike `ensureSession` it never starts a session: a keep-alive has nothing to
+ * keep alive if the old one has gone, and handing out a fresh empty session
+ * would only hide that from the page. `false` says exactly that, so the
+ * dashboard can tell the user instead of letting an export come back empty.
+ */
+export async function keepSessionAlive(): Promise<boolean> {
+  noStore()
+
+  const cookie = getCookie(SESSION_COOKIE)
+  if (!cookie || !SESSION_ID_PATTERN.test(cookie)) return false
+
+  const [session] = await db
+    .select()
+    .from(reportSessions)
+    .where(eq(reportSessions.id, cookie))
+
+  if (!session || isStale(session.lastSeenAt)) return false
+
+  await touch(cookie)
+  return true
 }
 
 /**

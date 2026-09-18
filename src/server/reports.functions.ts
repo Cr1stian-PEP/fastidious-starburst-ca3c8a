@@ -19,6 +19,7 @@ import {
 import {
   SESSION_IDLE_MINUTES,
   ensureSession,
+  keepSessionAlive,
   resetCurrentSession,
 } from './session.server.js'
 
@@ -111,6 +112,15 @@ export const resetFootprint = createServerFn({ method: 'POST' })
   .inputValidator(z.object({ material: z.string().trim().min(1).max(40) }))
   .handler(async ({ data }) => deleteFootprintOverride(data.material))
 
+// Reading the report — searching, filtering, sorting, expanding rows — never
+// reaches the server, so an active user looks idle to the session and can lose
+// their uploads mid-task. The dashboard pings this while its tab is being used.
+// It refreshes the idle window and starts nothing: `alive: false` means the
+// session has already gone, which the page says out loud.
+export const pingSession = createServerFn({ method: 'POST' }).handler(async () => ({
+  alive: await keepSessionAlive(),
+}))
+
 const sortDir = z.enum(['asc', 'desc'])
 
 // The dashboard's whole view state, so the workbook can be rebuilt server-side
@@ -151,6 +161,10 @@ export const exportVarianceWorkbook = createServerFn({ method: 'POST' })
         ]),
         dir: sortDir,
       }),
+      // Rows the browser has on screen for this view. The server rebuilds the
+      // view itself and checks its own result against this, so an export can't
+      // come back as an empty workbook while the report is sitting on screen.
+      shown: z.number().int().min(0),
       // Both stamps come from the browser so the file is dated in the reader's
       // own time zone rather than the server's.
       generatedAt: z.string().max(80),
