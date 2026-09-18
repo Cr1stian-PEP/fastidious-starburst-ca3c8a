@@ -614,6 +614,12 @@ export type VarianceExportRequest = {
   site: string
   materialSort: SortState<MaterialSortKey>
   loadSort: SortState<LoadSortKey>
+  /**
+   * How many rows the browser has on screen for this view. The server rebuilds
+   * the view rather than trusting the tab's rows, so this is the one thing it
+   * can check its own result against — see the mismatch guard below.
+   */
+  shown: number
   /** Formatted on the client, so the report is stamped in the reader's own time zone. */
   generatedAt: string
   dateStamp: string
@@ -697,6 +703,7 @@ export async function buildVarianceExport(sessionId: string, request: VarianceEx
   }
 
   let doc: ExportDocument
+  let exported: number
   if (request.view === 'load') {
     // The on-hand-only toggle is part of the allocation, not of the filter, so
     // the export has to run the same pass the screen did.
@@ -706,6 +713,7 @@ export async function buildVarianceExport(sessionId: string, request: VarianceEx
       shortfallsOnly: request.shortfallsOnly,
       sort: request.loadSort,
     })
+    exported = visible.length
     doc = buildLoadExport(visible, { ...context, shown: visible.length, total: loads.length })
   } else {
     const visible = filterAndSortMaterials(materials, {
@@ -715,11 +723,27 @@ export async function buildVarianceExport(sessionId: string, request: VarianceEx
       productionOnly: request.productionOnly,
       sort: request.materialSort,
     })
+    exported = visible.length
     doc = buildMaterialExport(visible, {
       ...context,
       shown: visible.length,
       total: materials.length,
     })
+  }
+
+  // A workbook with no rows in it is never the right answer to a view that has
+  // rows on screen. The two can only disagree if the tab and the server are no
+  // longer looking at the same thing — the session's uploads have gone (it timed
+  // out, or another tab cleared them), or the page has been open across a change
+  // to them. Either way the file would download looking like an empty report,
+  // which reads as "there is nothing to export" rather than "this went wrong",
+  // so say what happened instead of handing one over.
+  if (request.shown > 0 && exported === 0) {
+    throw new Error(
+      reportsWithLines.length === 0
+        ? 'These uploads are no longer in this browser session — it timed out or was cleared. Upload the three exports again, then export.'
+        : 'The report on screen no longer matches the uploads on the server. Reload the page, then export again.',
+    )
   }
 
   return { fileName: `${doc.fileName}.xlsx`, base64: buildWorkbookBase64(doc) }

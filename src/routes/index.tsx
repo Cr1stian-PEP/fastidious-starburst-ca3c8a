@@ -35,6 +35,7 @@ import {
   clearAllReports,
   exportVarianceWorkbook,
   getVarianceData,
+  pingSession,
   removeReport,
   uploadReport,
 } from '../server/reports.functions'
@@ -132,6 +133,12 @@ const CHART_GROUPS: Array<{ value: ChartGroup; label: string; icon: typeof Facto
 ]
 
 const CHART_LIMIT = 15
+
+// How often activity in the tab is allowed to refresh the session's idle window.
+// Far enough under the window (see sessionIdleMinutes) that a person reading the
+// report never falls out of it, and far enough apart that scrolling and typing
+// don't turn into a request per keystroke.
+const SESSION_PING_MS = 5 * 60 * 1000
 
 // Column T on the outbound loads export. Both conditions are stored at upload;
 // the default matches what the report has always shown.
@@ -609,6 +616,11 @@ function Home() {
           site,
           materialSort: sort,
           loadSort,
+          // The server rebuilds this view and refuses to hand back an empty
+          // workbook while the table has rows, so a lost session or a stale tab
+          // says so instead of downloading a file that looks like an empty
+          // report.
+          shown: ctx.shown,
           generatedAt: ctx.generatedAt,
           dateStamp: ctx.dateStamp,
         },
@@ -755,6 +767,48 @@ function Home() {
     setProductionOnly(false)
     setOnHandOnly(false)
   }, [hasProduction])
+
+  // Working through the report — searching, filtering, sorting, opening rows —
+  // is all client-side, so somebody reading it for half an hour makes no
+  // requests and the session's idle window runs out underneath them: the page
+  // still shows everything while the uploads behind it have been deleted, and
+  // the export, the one thing that goes back to the server, comes back empty.
+  //
+  // So real activity in this tab refreshes the window, throttled to once every
+  // few minutes and only while the tab is visible — a report left open on an
+  // unattended workstation still expires, which is the point of the timeout.
+  const hasUploads = data.reports.length > 0
+  const lastPingRef = useRef(Date.now())
+  useEffect(() => {
+    if (!hasUploads) return
+    let cancelled = false
+
+    async function ping() {
+      if (document.visibilityState !== 'visible') return
+      if (Date.now() - lastPingRef.current < SESSION_PING_MS) return
+      lastPingRef.current = Date.now()
+      try {
+        const { alive } = await pingSession()
+        if (cancelled || alive) return
+        // The uploads are already gone; reloading the report is what puts the
+        // page back in step with the server rather than leaving a report on
+        // screen that nothing can export.
+        setError(
+          `These uploads are no longer in this browser session — it timed out after ${data.sessionIdleMinutes} minutes without activity. Upload the three exports again.`,
+        )
+        await router.invalidate()
+      } catch {
+        // A ping that fails changes nothing; the next bit of activity retries.
+      }
+    }
+
+    const events = ['pointerdown', 'keydown', 'visibilitychange'] as const
+    for (const event of events) document.addEventListener(event, ping)
+    return () => {
+      cancelled = true
+      for (const event of events) document.removeEventListener(event, ping)
+    }
+  }, [hasUploads, data.sessionIdleMinutes, router])
 
   const chartData = {
     labels: chartRows.map((r) => r.label),
