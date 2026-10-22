@@ -80,7 +80,7 @@ const REPORT_COLUMNS: Record<
     quantity: 'S',
     // Both conditions are stored so the dashboard selector can switch between
     // them; anything else is still stray data and is dropped at upload.
-    condition: { column: 'T', allow: ['01', '02'] },
+    condition: { column: 'U', allow: ['01', '02'] },
     // The load number and the Customer PO both come out of columns K and L, and
     // which is which depends on the shipping condition: an 01 row is a customer
     // pickup with no load of its own, so L is simply its PO; an 02 row is a
@@ -89,10 +89,10 @@ const REPORT_COLUMNS: Record<
       '01': { customerPO: 'L' },
       '02': { orderNumber: 'L', customerPO: 'K' },
     },
-    plantName: 'W',
-    soldTo: 'Y',
-    loadingDate: 'AE',
-    shipDate: 'AG',
+    plantName: 'X',
+    soldTo: 'Z',
+    loadingDate: 'AF',
+    shipDate: 'AH',
   },
 }
 
